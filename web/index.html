@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TPC-H engine corpus</title>
+<style>
+  :root { --fg:#1a1a1a; --dim:#666; --line:#ddd; --bg:#fff; --accent:#0b5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e6e6; --dim:#999; --line:#333; --bg:#141414; --accent:#3d9; }
+  }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+         color: var(--fg); background: var(--bg); margin: 0; padding: 1.5rem;
+         max-width: 1500px; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
+  #status { color: var(--dim); margin-bottom: 1rem; }
+  #status.err { color: #c33; }
+  .row { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: .75rem;
+         align-items: center; }
+  .label { color: var(--dim); font-size: 12px; margin-right: .25rem; }
+  button { font: inherit; padding: .35rem .7rem; cursor: pointer;
+           background: var(--bg); color: var(--fg);
+           border: 1px solid var(--line); border-radius: 3px; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.on { border-color: var(--accent); color: var(--accent); }
+  textarea { width: 100%; font: inherit; padding: .6rem;
+             background: var(--bg); color: var(--fg);
+             border: 1px solid var(--line); border-radius: 3px; resize: vertical; }
+  #sql { min-height: 7rem; }
+  #spec { min-height: 14rem; }
+  #meta { color: var(--dim); margin: .75rem 0; }
+  .scroll { overflow: auto; max-height: 65vh; border: 1px solid var(--line);
+            border-radius: 3px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: .3rem .6rem; text-align: left; white-space: nowrap;
+           border-bottom: 1px solid var(--line); }
+  th { position: sticky; top: 0; background: var(--bg); font-weight: 600;
+       cursor: pointer; user-select: none; }
+  th:hover { color: var(--accent); }
+  td.num { text-align: left; font-variant-numeric: tabular-nums; }
+  tbody tr:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+  .panes { display: grid; grid-template-columns: 380px 1fr; gap: 1rem; }
+  @media (max-width: 900px) { .panes { grid-template-columns: 1fr; } }
+  #chart { border: 1px solid var(--line); border-radius: 3px; padding: .75rem;
+           overflow: auto; min-height: 20rem; background: var(--bg); }
+  .hide { display: none; }
+  #specerr { color: #c33; font-size: 12px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+
+<h1>TPC-H engine selection corpus</h1>
+<div id="status">loading database&hellip;</div>
+
+<div class="row"><span class="label">views</span><span id="views"></span></div>
+
+<textarea id="sql" spellcheck="false"></textarea>
+<div class="row" style="margin-top:.5rem">
+  <button id="run" disabled>Run  (Ctrl/Cmd+Enter)</button>
+  <button id="tabTable" class="on">Table</button>
+  <button id="tabChart">Chart</button>
+  <button id="csv" disabled>CSV</button>
+  <button id="png" disabled class="hide">SVG</button>
+  <button id="link" disabled>Copy link</button>
+  <span id="meta"></span>
+</div>
+
+<div id="paneTable"><div class="scroll">
+  <table><thead id="head"></thead><tbody id="body"></tbody></table>
+</div></div>
+
+<div id="paneChart" class="hide panes">
+  <div>
+    <div class="label">Vega-Lite spec &mdash; data is injected as <code>values</code></div>
+    <textarea id="spec" spellcheck="false"></textarea>
+    <div id="specerr"></div>
+  </div>
+  <div id="chart"></div>
+</div>
+
+<script src="sql-wasm.js"></script>
+<script src="vega.min.js"></script>
+<script src="vega-lite.min.js"></script>
+<script src="vega-embed.min.js"></script>
+<script>
+// Override with #db=name.sqlite . Falls back through the usual names so the
+// page works whether the published copy is corpus.sqlite or corpus.db.
+const DB_CANDIDATES = ["corpus.sqlite", "corpus.db", "publish.sqlite"];
+
+const VIEWS = {
+ "crossover by size": {
+  "sql": "-- Ratio below 1 means the compiled engine (h) won.\n-- Faceted by node: since 0019 these are separate machines, and an ARM\n-- Neoverse result must not be averaged with a Xeon one.\nSELECT node, cpu_vendor, config_name, query, scale_factor, threads,\n       ROUND(AVG(h_over_v), 4) AS h_over_v\nFROM engine_pair ep\nJOIN machine_snapshot ms USING (snapshot_id)\nGROUP BY binary_id, snapshot_id, query_id, dataset_id, threads\nORDER BY node, query, scale_factor",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\"\n    }\n  },\n  \"spec\": {\n    \"width\": 200,\n    \"height\": 160,\n    \"layer\": [\n      {\n        \"mark\": {\n          \"type\": \"rule\",\n          \"strokeDash\": [\n            4,\n            4\n          ],\n          \"color\": \"#888\"\n        },\n        \"encoding\": {\n          \"y\": {\n            \"datum\": 1\n          }\n        }\n      },\n      {\n        \"mark\": {\n          \"type\": \"line\",\n          \"point\": true\n        },\n        \"encoding\": {\n          \"x\": {\n            \"field\": \"scale_factor\",\n            \"type\": \"quantitative\",\n            \"scale\": {\n              \"type\": \"log\"\n            },\n            \"title\": \"scale factor\"\n          },\n          \"y\": {\n            \"field\": \"h_over_v\",\n            \"type\": \"quantitative\",\n            \"scale\": {\n              \"type\": \"log\"\n            },\n            \"title\": \"h / v\"\n          },\n          \"color\": {\n            \"field\": \"threads\",\n            \"type\": \"nominal\"\n          },\n          \"tooltip\": [\n            {\n              \"field\": \"node\"\n            },\n            {\n              \"field\": \"query\"\n            },\n            {\n              \"field\": \"scale_factor\"\n            },\n            {\n              \"field\": \"h_over_v\"\n            }\n          ]\n        }\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "engine duel (incl. b)": {
+  "sql": "-- All three engine pairs, including 'b' (q6 branching), which\n-- engine_pair cannot see. 'winner' names an engine code.\nSELECT node, cpu_vendor, config_name, pair, query, sf_label, threads,\n       ROUND(a_over_b, 3) AS a_over_b, ROUND(z, 2) AS z, winner\nFROM engine_duel\nORDER BY node, query, pair",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"pair\",\n      \"type\": \"nominal\"\n    }\n  },\n  \"spec\": {\n    \"width\": 200,\n    \"height\": 170,\n    \"mark\": {\n      \"type\": \"point\",\n      \"filled\": true,\n      \"size\": 80\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"query\",\n        \"type\": \"nominal\",\n        \"title\": null\n      },\n      \"y\": {\n        \"field\": \"a_over_b\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\"\n        },\n        \"title\": \"a / b\"\n      },\n      \"color\": {\n        \"field\": \"winner\",\n        \"type\": \"nominal\"\n      },\n      \"shape\": {\n        \"field\": \"threads\",\n        \"type\": \"nominal\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"pair\"\n        },\n        {\n          \"field\": \"query\"\n        },\n        {\n          \"field\": \"a_over_b\"\n        },\n        {\n          \"field\": \"z\"\n        },\n        {\n          \"field\": \"winner\"\n        }\n      ]\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "vendor effect": {
+  "sql": "-- The comparison 0019 exists to make possible: does the winner change\n-- with hardware? If h_win_pct differs sharply across nodes, the paradigm\n-- choice is hardware-dependent -- which is the whole hypothesis.\nSELECT node, cpu_vendor, config_name, query, cells, h_wins, v_wins, ties,\n       h_win_pct, mean_cv\nFROM v_win_rate_by_build_query\nJOIN machine_snapshot ms USING (snapshot_id)\nORDER BY query, node",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 400,\n  \"height\": 280,\n  \"mark\": \"bar\",\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"y\": {\n      \"field\": \"h_win_pct\",\n      \"type\": \"quantitative\",\n      \"title\": \"h win %\",\n      \"scale\": {\n        \"domain\": [\n          0,\n          100\n        ]\n      }\n    },\n    \"xOffset\": {\n      \"field\": \"node\"\n    },\n    \"color\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"config_name\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"cpu_vendor\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"h_win_pct\"\n      },\n      {\n        \"field\": \"cells\"\n      },\n      {\n        \"field\": \"ties\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "scaling curve": {
+  "sql": "-- Log-log: slope -1 is perfect scaling. Faceted by node because\n-- core counts differ (dubliner 384t, manchego 128t, burrata 80t).\nSELECT node, config_name, query, sf_label, engine, threads, median_ms\nFROM v_runs WHERE quality = 'clean'\nORDER BY node, query, threads",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\"\n    }\n  },\n  \"spec\": {\n    \"width\": 190,\n    \"height\": 160,\n    \"mark\": {\n      \"type\": \"line\",\n      \"point\": true\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"threads\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\",\n          \"base\": 2\n        }\n      },\n      \"y\": {\n        \"field\": \"median_ms\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\"\n        },\n        \"title\": \"median ms\"\n      },\n      \"color\": {\n        \"field\": \"engine\",\n        \"type\": \"nominal\"\n      },\n      \"strokeDash\": {\n        \"field\": \"sf_label\",\n        \"type\": \"nominal\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"engine\"\n        },\n        {\n          \"field\": \"threads\"\n        },\n        {\n          \"field\": \"median_ms\"\n        }\n      ]\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "effect vs noise": {
+  "sql": "-- Gap against dispersion. Points in the shaded band are ties: the\n-- difference is smaller than twice the measurement noise of that cell.\nSELECT node, query, sf_label, threads, config_name,\n       ROUND(rel_diff, 4) AS rel_diff, ROUND(pooled_cv, 4) AS pooled_cv,\n       ROUND(z, 2) AS z, winner\nFROM engine_pair",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 460,\n  \"height\": 330,\n  \"layer\": [\n    {\n      \"mark\": {\n        \"type\": \"area\",\n        \"opacity\": 0.12,\n        \"color\": \"#888\"\n      },\n      \"transform\": [\n        {\n          \"calculate\": \"datum.pooled_cv*2\",\n          \"as\": \"hi\"\n        },\n        {\n          \"calculate\": \"-datum.pooled_cv*2\",\n          \"as\": \"lo\"\n        }\n      ],\n      \"encoding\": {\n        \"x\": {\n          \"field\": \"pooled_cv\",\n          \"type\": \"quantitative\"\n        },\n        \"y\": {\n          \"field\": \"lo\",\n          \"type\": \"quantitative\"\n        },\n        \"y2\": {\n          \"field\": \"hi\"\n        }\n      }\n    },\n    {\n      \"mark\": {\n        \"type\": \"point\",\n        \"filled\": true,\n        \"size\": 70\n      },\n      \"encoding\": {\n        \"x\": {\n          \"field\": \"pooled_cv\",\n          \"type\": \"quantitative\",\n          \"title\": \"pooled cv\"\n        },\n        \"y\": {\n          \"field\": \"rel_diff\",\n          \"type\": \"quantitative\",\n          \"title\": \"relative difference (<0 = h wins)\"\n        },\n        \"color\": {\n          \"field\": \"winner\",\n          \"type\": \"nominal\",\n          \"scale\": {\n            \"domain\": [\n              \"h\",\n              \"v\",\n              \"tie\"\n            ],\n            \"range\": [\n              \"#0b5\",\n              \"#c50\",\n              \"#888\"\n            ]\n          }\n        },\n        \"shape\": {\n          \"field\": \"node\",\n          \"type\": \"nominal\"\n        },\n        \"tooltip\": [\n          {\n            \"field\": \"node\"\n          },\n          {\n            \"field\": \"query\"\n          },\n          {\n            \"field\": \"threads\"\n          },\n          {\n            \"field\": \"rel_diff\"\n          },\n          {\n            \"field\": \"pooled_cv\"\n          },\n          {\n            \"field\": \"z\"\n          }\n        ]\n      }\n    }\n  ],\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "dispersion": {
+  "sql": "-- What the tie threshold should be. The |z|<2 band is ~1% if cv is\n-- 0.005 and ~6% if it is 0.03; these differ by node.\nSELECT node, query, sf_label, engine, threads, cv, median_ms\nFROM v_runs WHERE cv IS NOT NULL AND quality='clean'",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 440,\n  \"height\": 290,\n  \"mark\": {\n    \"type\": \"point\",\n    \"filled\": true,\n    \"size\": 60,\n    \"opacity\": 0.7\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"median_ms\",\n      \"type\": \"quantitative\",\n      \"scale\": {\n        \"type\": \"log\"\n      },\n      \"title\": \"median ms\"\n    },\n    \"y\": {\n      \"field\": \"cv\",\n      \"type\": \"quantitative\",\n      \"title\": \"coefficient of variation\"\n    },\n    \"color\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"shape\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"threads\"\n      },\n      {\n        \"field\": \"cv\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "counters (cross-vendor safe)": {
+  "sql": "-- Only counters that mean the same thing on ARM and x86: cycles,\n-- instructions, task_clock. LLC/L1/store/load events are microarchitectural\n-- and must not be pooled across vendors -- use v_counters for one vendor.\nSELECT r.node, r.config_name, r.query, r.engine, r.threads, r.median_ms,\n       MAX(CASE WHEN c.event='cycles'       THEN c.value END) AS cycles,\n       MAX(CASE WHEN c.event='instructions' THEN c.value END) AS instructions,\n       ROUND(MAX(CASE WHEN c.event='instructions' THEN c.value END) /\n             NULLIF(MAX(CASE WHEN c.event='cycles' THEN c.value END),0), 3) AS ipc\nFROM v_runs r JOIN v_counters_comparable c ON c.run_id = r.run_id\nGROUP BY r.run_id ORDER BY r.node, r.query",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 440,\n  \"height\": 300,\n  \"mark\": {\n    \"type\": \"point\",\n    \"filled\": true\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"median_ms\",\n      \"type\": \"quantitative\",\n      \"scale\": {\n        \"type\": \"log\"\n      },\n      \"title\": \"median ms\"\n    },\n    \"y\": {\n      \"field\": \"ipc\",\n      \"type\": \"quantitative\",\n      \"title\": \"IPC (recomputed)\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"shape\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\"\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"engine\"\n      },\n      {\n        \"field\": \"ipc\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "coverage": {
+  "sql": "-- What exists, per node. Gaps here are the campaign's to-do list.\nSELECT node, config_name, sf_label, COUNT(*) AS pairs,\n       queries, thread_counts\nFROM v_build_balance\nGROUP BY binary_id, snapshot_id, sf_label\nORDER BY node, config_name",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 360,\n  \"height\": 240,\n  \"mark\": \"rect\",\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"sf_label\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"y\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"color\": {\n      \"field\": \"pairs\",\n      \"type\": \"quantitative\",\n      \"scale\": {\n        \"scheme\": \"greens\"\n      },\n      \"title\": \"cells\"\n    },\n    \"column\": {\n      \"field\": \"config_name\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"config_name\"\n      },\n      {\n        \"field\": \"sf_label\"\n      },\n      {\n        \"field\": \"pairs\"\n      },\n      {\n        \"field\": \"queries\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "headers by machine": {
+  "sql": "-- Which counter columns each header layout supplies. burrata's PMU\n-- exposes fewer events, so its .out has 17 columns against v4's 21.\nSELECT header_version, total_cols, counter_cols, timing_cols\nFROM v_header_expectations ORDER BY header_version",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 380,\n  \"height\": 220,\n  \"mark\": \"bar\",\n  \"encoding\": {\n    \"y\": {\n      \"field\": \"header_version\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"x\": {\n      \"field\": \"counter_cols\",\n      \"type\": \"quantitative\",\n      \"title\": \"counter columns\"\n    },\n    \"color\": {\n      \"field\": \"counter_cols\",\n      \"type\": \"quantitative\",\n      \"scale\": {\n        \"scheme\": \"greens\"\n      },\n      \"legend\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"header_version\"\n      },\n      {\n        \"field\": \"total_cols\"\n      },\n      {\n        \"field\": \"counter_cols\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ },
+ "table only": {
+  "sql": "SELECT * FROM v_runs ORDER BY node, config_name, sf_label, query, threads",
+  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"mark\": \"bar\",\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\"\n    },\n    \"y\": {\n      \"field\": \"median_ms\",\n      \"aggregate\": \"median\",\n      \"type\": \"quantitative\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+ }
+};
+
+const $ = id => document.getElementById(id);
+const status = $("status"), meta = $("meta"), specerr = $("specerr");
+let db = null, cols = [], rows = [], sortCol = null, sortDir = 1, tab = "table";
+
+// ---- URL state: SQL, spec and active tab all travel in the hash. Hash rather
+// than query string, so shared links never reach the server and cannot be
+// rewritten by a proxy.
+function readHash() {
+  const out = {};
+  for (const part of location.hash.replace(/^#/, "").split("&")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    try { out[part.slice(0, i)] = decodeURIComponent(part.slice(i + 1)); }
+    catch { /* malformed; ignore */ }
+  }
+  return out;
+}
+function shareURL() {
+  return location.origin + location.pathname + "#q=" + encodeURIComponent($("sql").value)
+       + "&v=" + encodeURIComponent($("spec").value) + "&t=" + tab;
+}
+function syncHash() { history.replaceState(null, "", shareURL().split("#")[1] ? "#" + shareURL().split("#")[1] : ""); }
+
+// ---- view buttons: SQL and spec together, so one click is a finished figure
+for (const name of Object.keys(VIEWS)) {
+  const b = document.createElement("button");
+  b.textContent = name;
+  b.onclick = () => {
+    $("sql").value  = VIEWS[name].sql;
+    $("spec").value = VIEWS[name].spec;
+    setTab(name === "table only" ? "table" : "chart");
+    run();
+  };
+  $("views").appendChild(b);
+}
+
+const h0 = readHash();
+$("sql").value  = h0.q || VIEWS["vendor effect"].sql;
+$("spec").value = h0.v || VIEWS["vendor effect"].spec;
+
+function setTab(t) {
+  tab = t;
+  $("tabTable").classList.toggle("on", t === "table");
+  $("tabChart").classList.toggle("on", t === "chart");
+  $("paneTable").classList.toggle("hide", t !== "table");
+  $("paneChart").classList.toggle("hide", t !== "chart");
+  $("png").classList.toggle("hide", t !== "chart");
+  if (t === "chart") draw();
+  syncHash();
+}
+$("tabTable").onclick = () => setTab("table");
+$("tabChart").onclick = () => setTab("chart");
+
+function fail(msg) { status.textContent = msg; status.className = "err"; }
+
+(async () => {
+  try {
+    const SQL = await initSqlJs({ locateFile: f => f });
+    const names = h0.db ? [h0.db, ...DB_CANDIDATES] : DB_CANDIDATES;
+    let res = null, tried = [];
+    for (const n of names) {
+      const r = await fetch(n, { cache: "no-cache" });
+      if (r.ok) { res = r; break; }
+      tried.push(`${n} (${r.status})`);
+    }
+    if (!res) throw new Error("no database found: tried " + tried.join(", "));
+    const buf = await res.arrayBuffer();
+    db = new SQL.Database(new Uint8Array(buf));
+    const n = db.exec("SELECT COUNT(*) FROM run")[0]?.values[0][0] ?? 0;
+    const when = res.headers.get("last-modified");
+    status.textContent = `${n.toLocaleString()} runs \u00b7 ${(buf.byteLength/1048576).toFixed(1)} MB`
+      + (when ? ` \u00b7 published ${when}` : "");
+    $("run").disabled = $("csv").disabled = $("link").disabled = $("png").disabled = false;
+    setTab(h0.t === "chart" ? "chart" : "table");
+    run();
+  } catch (e) { fail("could not load database: " + e.message); }
+})();
+
+function run() {
+  if (!db) return;
+  const t0 = performance.now();
+  try {
+    const out = db.exec($("sql").value);
+    if (!out.length) { cols = []; rows = []; meta.textContent = "no rows"; render(); draw(); return; }
+    cols = out[0].columns; rows = out[0].values; sortCol = null;
+    meta.textContent = `${rows.length.toLocaleString()} rows \u00b7 ${(performance.now()-t0).toFixed(0)} ms`;
+    status.className = "";
+    render();
+    if (tab === "chart") draw();
+    syncHash();
+  } catch (e) { meta.textContent = ""; fail("SQL error: " + e.message); }
+}
+
+// rows/cols -> array of objects, which is what Vega-Lite wants
+function records() {
+  return rows.map(r => Object.fromEntries(cols.map((c, i) => [c, r[i]])));
+}
+
+let chartView = null;
+async function draw() {
+  if (tab !== "chart" || !rows.length) return;
+  specerr.textContent = "";
+  let spec;
+  try { spec = JSON.parse($("spec").value); }
+  catch (e) { specerr.textContent = "spec is not valid JSON: " + e.message; return; }
+  // Inject the query result. Any data block in the spec is replaced, so the
+  // chart always reflects the query above it.
+  spec.data = { values: records() };
+  try {
+    if (chartView) { chartView.finalize(); chartView = null; }
+    const r = await vegaEmbed("#chart", spec, {
+      actions: false, renderer: "svg",
+      theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : undefined
+    });
+    chartView = r.view;
+  } catch (e) {
+    specerr.textContent = "Vega-Lite: " + (e.message || e);
+  }
+}
+
+let specTimer = null;
+$("spec").oninput = () => { clearTimeout(specTimer); specTimer = setTimeout(draw, 400); };
+
+function render() {
+  const idx = sortCol === null ? null : cols.indexOf(sortCol);
+  let r = rows;
+  if (idx !== null) {
+    r = [...rows].sort((a, b) => {
+      const x = a[idx], y = b[idx];
+      if (x === y) return 0;
+      if (x === null) return 1;
+      if (y === null) return -1;
+      return (typeof x === "number" && typeof y === "number" ? x - y
+              : String(x).localeCompare(String(y))) * sortDir;
+    });
+  }
+  $("head").innerHTML = "<tr>" + cols.map(c =>
+    `<th data-c="${c}">${c}${c === sortCol ? (sortDir > 0 ? " \u25b2" : " \u25bc") : ""}</th>`).join("") + "</tr>";
+  for (const th of $("head").querySelectorAll("th")) {
+    th.onclick = () => {
+      const c = th.dataset.c;
+      sortDir = (c === sortCol) ? -sortDir : 1;
+      sortCol = c; render();
+    };
+  }
+  const shown = r.slice(0, 2000);
+  $("body").innerHTML = shown.map(row => "<tr>" + row.map(v =>
+    `<td class="${typeof v === "number" ? "num" : ""}">${
+      v === null ? "" : String(v).replace(/[&<>]/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[m]))
+    }</td>`).join("") + "</tr>").join("");
+}
+
+$("run").onclick = run;
+$("sql").onkeydown = e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); run(); }
+};
+$("spec").onkeydown = e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); draw(); }
+};
+
+async function toClipboard(text) {
+  // navigator.clipboard needs a secure context; undefined over plain http.
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.cssText = "position:fixed;opacity:0";
+  document.body.appendChild(ta); ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch {}
+  ta.remove();
+  return ok;
+}
+
+$("link").onclick = async () => {
+  const url = shareURL(), was = meta.textContent;
+  const ok = await toClipboard(url);
+  meta.textContent = ok ? `link copied \u00b7 ${url.length} chars`
+                        : "could not copy \u2014 the address bar already holds it";
+  setTimeout(() => { meta.textContent = was; }, 2500);
+};
+
+$("csv").onclick = () => {
+  const esc = v => v === null ? "" :
+    /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const blob = new Blob([[cols.join(","), ...rows.map(r => r.map(esc).join(","))].join("\n")],
+                        { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "corpus_query.csv"; a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// SVG export: vector, so it drops straight into a paper without resampling.
+$("png").onclick = async () => {
+  if (!chartView) return;
+  const svg = await chartView.toSVG();
+  const blob = new Blob([svg], { type: "image/svg+xml" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "corpus_figure.svg"; a.click();
+  URL.revokeObjectURL(a.href);
+};
+</script>
+</body>
+</html>

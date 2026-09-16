@@ -8,8 +8,12 @@ Checks (exit 0 = healthy, 1 = problems found):
   * SQLite integrity_check == ok
   * no foreign-key violations
   * per-build shape invariant: runs == tasks * engines
-  * per-build run_counter uniformity (v1 headers => 15 counters/run,
-    v2 headers => 14, after the br. misses dedup)
+  * run_counter uniformity, checked per (build, machine, header version)
+    against v_header_expectations rather than hardcoded counts -- the
+    expected number depends on hardware (v4_burrata exposes 10 counters,
+    v4_manchego 13, v4 14) as well as on the run.cpp revision
+  * engines measured per cell, so a 'b' run with no h/v counterpart, or a
+    cell missing one engine entirely, is reported
   * latest ingest batches (freshness / header-version)
 
 --full additionally prints all table counts.
@@ -45,9 +49,9 @@ def main() -> int:
         if fk:
             problems.append(f"{len(fk)} foreign-key violations")
 
-        print("== per-build shape ==")
+        print("== shape, per build and node ==")
         shapes = conn.execute("""
-            SELECT be.build_event_id, bs.config_name,
+            SELECT be.build_event_id, bs.config_name, m.stable_key AS node,
                    COUNT(DISTINCT r.run_id)       AS runs,
                    COUNT(DISTINCT t.task_id)      AS tasks,
                    COUNT(DISTINCT t.query_id)     AS queries,
@@ -55,34 +59,95 @@ def main() -> int:
                    COUNT(DISTINCT r.engine_id)    AS engines,
                    COUNT(DISTINCT r.snapshot_id)  AS snapshots
             FROM run r
-            JOIN build_event be ON be.build_event_id = r.build_event_id
-            JOIN build_spec bs  ON bs.spec_id = be.spec_id
-            JOIN task t         ON t.task_id = r.task_id
-            GROUP BY be.build_event_id, bs.config_name
-            ORDER BY be.build_event_id
+            JOIN build_event be      ON be.build_event_id = r.build_event_id
+            JOIN build_spec bs       ON bs.spec_id = be.spec_id
+            JOIN task t              ON t.task_id = r.task_id
+            JOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id
+            JOIN machine m           ON m.machine_id = ms.machine_id
+            GROUP BY be.build_event_id, bs.config_name, m.stable_key
+            ORDER BY be.build_event_id, m.stable_key
         """).fetchall()
         if not shapes:
             print("  (no builds with runs)")
-        for be, cfg, runs, tasks, queries, threads, engines, snaps in shapes:
-            print(f"  be{be:<3} {cfg:<16} runs={runs:<4} tasks={tasks:<3} "
-                  f"queries={queries} threads={threads} engines={engines} "
-                  f"snapshots={snaps}")
-            expect = tasks * engines
-            if runs != expect:
-                problems.append(
-                    f"build be{be}: runs={runs} != tasks({tasks})*engines({engines})={expect}")
+        for be, cfg, node, runs, tasks, queries, threads, engines, snaps in shapes:
+            print(f"  be{be:<3} {cfg:<16} {node:<10} runs={runs:<5} tasks={tasks:<3} "
+                  f"queries={queries} threads={threads} engines={engines}")
             if queries == 0:
-                problems.append(f"build be{be}: no queries")
+                problems.append(f"build be{be} on {node}: no queries")
 
-        print("== run_counter consistency per build ==")
-        for be, cnt, n in conn.execute("""
-            SELECT r.build_event_id, c.cnt AS counters, COUNT(*) AS n_runs
-            FROM (SELECT run_id, COUNT(*) AS cnt FROM run_counter GROUP BY run_id) c
-            JOIN run r ON r.run_id = c.run_id
-            GROUP BY r.build_event_id, c.cnt
-            ORDER BY r.build_event_id, c.cnt
+        # runs == tasks * engines is NOT a valid invariant. Engine count varies
+        # by query -- q6 emits v/h/b while everything else emits v/h -- so the
+        # expected total is the sum over cells of that cell's engine count, not
+        # a product. Compare against what each query actually uses on that node.
+        for be, node, q, got, want in conn.execute("""
+            WITH per_query AS (
+                SELECT r.build_event_id AS be, ms.machine_id, t.query_id,
+                       COUNT(DISTINCT r.engine_id) AS engines,
+                       COUNT(DISTINCT t.task_id)   AS tasks,
+                       COUNT(*)                    AS runs
+                FROM run r
+                JOIN task t              ON t.task_id = r.task_id
+                JOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id
+                WHERE r.quality = 'clean'
+                GROUP BY r.build_event_id, ms.machine_id, t.query_id
+            )
+            SELECT pq.be, m.stable_key, q.label, pq.runs, pq.tasks * pq.engines
+            FROM per_query pq
+            JOIN machine m ON m.machine_id = pq.machine_id
+            JOIN query q   ON q.query_id = pq.query_id
+            WHERE pq.runs != pq.tasks * pq.engines
         """):
-            print(f"  be{be} : {cnt} counters x {n} runs")
+            problems.append(
+                f"build be{be} on {node}, {q}: runs={got} != "
+                f"tasks*engines={want} -- a cell is missing an engine")
+
+        print("== run_counter consistency (build x node x header) ==")
+        # Expected counter count comes from the vocabulary, not a constant:
+        # it varies by run.cpp revision AND by hardware, because the profiler
+        # only emits a column when the node's PMU exposes the event.
+        expected = {r[0]: r[1] for r in conn.execute(
+            "SELECT header_version, counter_cols FROM v_header_expectations")}
+        for be, node, hv, cnt, n in conn.execute("""
+            SELECT r.build_event_id, m.stable_key, ib.header_version,
+                   c.cnt AS counters, COUNT(*) AS n_runs
+            FROM (SELECT run_id, COUNT(*) AS cnt FROM run_counter GROUP BY run_id) c
+            JOIN run r               ON r.run_id = c.run_id
+            JOIN ingest_batch ib     ON ib.batch_id = r.batch_id
+            JOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id
+            JOIN machine m           ON m.machine_id = ms.machine_id
+            GROUP BY r.build_event_id, m.stable_key, ib.header_version, c.cnt
+            ORDER BY r.build_event_id, m.stable_key, c.cnt
+        """):
+            want = expected.get(hv)
+            mark = "" if want is None or cnt == want else f"  != {want} expected"
+            print(f"  be{be} {node:10s} {hv:12s} {cnt:3d} counters x {n:4d} runs{mark}")
+            if want is not None and cnt != want:
+                problems.append(
+                    f"build be{be} on {node} under {hv}: {n} run(s) have {cnt} "
+                    f"counters, vocabulary says {want}")
+
+        print("== engines per cell ==")
+        # A cell measured for only some engines is worth nothing for comparison.
+        # With 'b' (q6 branching) this is easy to hit: baseline runs emit v/h/b
+        # for q6 but only v/h elsewhere, so 2 is correct outside q6 and 3 inside.
+        for q, node, k, n in conn.execute("""
+            SELECT qq.label, m.stable_key, x.k, COUNT(*)
+            FROM (SELECT task_id, build_event_id, snapshot_id, trial,
+                         COUNT(DISTINCT engine_id) AS k
+                  FROM run WHERE quality = 'clean'
+                  GROUP BY task_id, build_event_id, snapshot_id, trial) x
+            JOIN task t              ON t.task_id = x.task_id
+            JOIN query qq            ON qq.query_id = t.query_id
+            JOIN machine_snapshot ms ON ms.snapshot_id = x.snapshot_id
+            JOIN machine m           ON m.machine_id = ms.machine_id
+            GROUP BY qq.label, m.stable_key, x.k
+            ORDER BY qq.q_number, m.stable_key
+        """):
+            print(f"  {q:5s} {node:10s} {k} engine(s) x {n:4d} cells")
+            if k < 2:
+                problems.append(
+                    f"{q} on {node}: {n} cell(s) with only {k} engine "
+                    f"-- nothing to compare against")
 
         if a.full:
             print("== table counts ==")
