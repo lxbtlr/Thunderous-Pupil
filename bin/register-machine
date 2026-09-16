@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""
+register-machine [--node NAME] [--partition P]  ->  snapshot_id on stdout
+
+Runs on the compute node. Captures lscpu / lstopo / numactl / sysfs verbatim,
+computes the fingerprint, gets-or-creates the snapshot.
+
+Fails loudly if the fingerprint moved since the last recording for this node:
+an unannounced kernel or microcode change mid-campaign invalidates every
+comparison spanning it, and a hard stop in the prologue is cheap compared to
+finding out afterward.
+"""
+import argparse, os, socket, sys
+import _common  # noqa: F401
+from corpus.db import writing, utcnow, get_or_create, one
+from corpus.hashing import machine_fingerprint, text_sha256
+from corpus import sysinfo
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--node", default=os.environ.get("SLURMD_NODENAME") or socket.gethostname())
+ap.add_argument("--partition", default=os.environ.get("SLURM_JOB_PARTITION"))
+ap.add_argument("--allow-drift", action="store_true",
+                help="record a changed fingerprint instead of failing")
+a = ap.parse_args()
+
+captures = sysinfo.capture_all()
+snap = sysinfo.parse_snapshot(captures)
+fp = machine_fingerprint(snap)
+now = utcnow()
+
+with writing() as conn:
+    machine_id, _ = get_or_create(
+        conn, "machine", {"stable_key": a.node},
+        {"stable_key": a.node, "partition": a.partition, "first_seen": now},
+        "machine_id")
+
+    prev = conn.execute(
+        "SELECT snapshot_id, fingerprint FROM machine_snapshot "
+        "WHERE machine_id = ? ORDER BY observed_from DESC LIMIT 1",
+        (machine_id,)).fetchone()
+
+    if prev and prev["fingerprint"] != fp and not a.allow_drift:
+        sys.exit(
+            f"FINGERPRINT DRIFT on {a.node}: hardware or kernel changed since "
+            f"snapshot {prev['snapshot_id']}. Comparisons spanning this change "
+            f"are invalid. Re-run with --allow-drift once you have decided how "
+            f"to segment the campaign.")
+
+    existing = one(conn, "SELECT snapshot_id FROM machine_snapshot "
+                         "WHERE machine_id = ? AND fingerprint = ?", (machine_id, fp))
+    if existing:
+        print(existing)
+        sys.exit(0)
+
+    if prev:
+        conn.execute("UPDATE machine_snapshot SET observed_to = ? WHERE snapshot_id = ?",
+                     (now, prev["snapshot_id"]))
+
+    cols = ["machine_id", "fingerprint"] + list(snap.keys()) + ["observed_from"]
+    vals = [machine_id, fp] + list(snap.values()) + [now]
+    cur = conn.execute(
+        f"INSERT INTO machine_snapshot ({','.join(cols)}) "
+        f"VALUES ({','.join('?' * len(cols))})", vals)
+    sid = cur.lastrowid
+
+    for c in captures:
+        raw = c["text"] or ""
+        conn.execute(
+            "INSERT OR IGNORE INTO spec_capture "
+            "(snapshot_id, tool, tool_args, exit_code, raw_text, raw_sha256, captured_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (sid, c["tool"], c["args"], c["exit_code"], raw, text_sha256(raw), now))
+
+print(sid)

@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""
+vocab [events|columns|engines|queries|datasets|builds]
+
+Read-only. What exists, so job scripts and the ingest agree on names.
+Extending a vocabulary is a migration a human applies, never a side effect.
+"""
+import argparse, sys
+import _common  # noqa: F401
+from corpus.db import read_only
+
+Q = {
+  "events":  "SELECT event_id, canonical_name, unit, kind FROM pmu_event ORDER BY event_id",
+  "columns": "SELECT header_version, col_ord, raw_header, role, timing_stat, event_id "
+             "FROM csv_column ORDER BY header_version, col_ord",
+  "engines": "SELECT engine_id, code, name, paradigm FROM engine ORDER BY engine_id",
+  "queries": "SELECT query_id, q_number, label FROM query ORDER BY q_number",
+  "datasets":"SELECT dataset_id, sf_label, scale_factor, file_count, total_bytes, data_dir "
+             "FROM dataset ORDER BY scale_factor",
+  "builds":  "SELECT be.build_event_id, bs.config_name, hex(bs.repo_sha) AS head, "
+             "bs.cmake_defs, substr(hex(b.content_sha256),1,12) AS binary_sha, be.binary_path "
+             "FROM build_event be JOIN build_spec bs ON bs.spec_id=be.spec_id "
+             "JOIN binary b ON b.binary_id=be.binary_id ORDER BY be.build_event_id",
+}
+
+ap = argparse.ArgumentParser()
+ap.add_argument("what", nargs="?", default="events", choices=sorted(Q))
+a = ap.parse_args()
+
+with read_only() as conn:
+    rows = conn.execute(Q[a.what]).fetchall()
+    if not rows:
+        print(f"(no {a.what})"); sys.exit(0)
+    cols = rows[0].keys()
+    w = {c: max(len(c), *(len(str(r[c])) for r in rows)) for c in cols}
+    print("  ".join(c.ljust(w[c]) for c in cols))
+    print("  ".join("-" * w[c] for c in cols))
+    for r in rows:
+        print("  ".join(str(r[c]).ljust(w[c]) for c in cols))

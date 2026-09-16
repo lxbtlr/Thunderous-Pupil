@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""
+register-dataset --dir /tank/alexb/swole/tpch/sf10 [--content]  ->  dataset_id
+
+Identifies a TPC-H directory by a manifest hash, not by path. If that
+directory is ever regenerated, every earlier run would otherwise silently
+claim data it did not use; here it becomes a hard failure at the next job.
+
+Run once per scale factor, when the data is generated. Not part of the job path.
+"""
+import argparse, json, re, sys
+import _common  # noqa: F401
+from corpus.db import writing, utcnow, one
+from corpus.hashing import dataset_manifest
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--dir", required=True)
+ap.add_argument("--sf", help="scale factor; inferred from the directory name if omitted")
+ap.add_argument("--content", action="store_true",
+                help="hash file contents rather than size+mtime (slow at sf100, "
+                     "but worth it once at first registration)")
+a = ap.parse_args()
+
+sf_label = a.dir.rstrip("/").split("/")[-1]
+if a.sf:
+    sf = float(a.sf)
+else:
+    m = re.match(r"sf(\d+)$", sf_label)
+    if m:                      # sf1 -> 1, sf100 -> 100
+        sf = float(m.group(1))
+    elif re.match(r"sf0+\d+$", sf_label):   # sf001 -> 0.01, sf01 -> 0.1
+        sf = float("0." + sf_label[2:])
+    else:
+        sys.exit(f"cannot infer scale factor from {sf_label!r}; pass --sf")
+
+digest, manifest = dataset_manifest(a.dir, content=a.content)
+total = sum(e["b"] for e in manifest["files"])
+
+with writing() as conn:
+    existing = conn.execute(
+        "SELECT dataset_id, data_dir FROM dataset WHERE manifest_sha256 = ?",
+        (digest,)).fetchone()
+    if existing:
+        print(existing["dataset_id"]); sys.exit(0)
+
+    clash = one(conn, "SELECT dataset_id FROM dataset WHERE sf_label = ? AND benchmark = 'tpch'",
+                (sf_label,))
+    if clash:
+        sys.exit(
+            f"MANIFEST CHANGED for {sf_label}: dataset {clash} was registered from "
+            f"this scale factor with different contents. The data was regenerated. "
+            f"Decide explicitly whether prior runs remain comparable before "
+            f"registering a second dataset for the same label.")
+
+    cur = conn.execute(
+        "INSERT INTO dataset (benchmark, sf_label, scale_factor, data_dir, "
+        "manifest_sha256, file_count, total_bytes, manifest_json, registered_at) "
+        "VALUES ('tpch',?,?,?,?,?,?,?,?)",
+        (sf_label, sf, a.dir, digest, len(manifest["files"]), total,
+         json.dumps(manifest), utcnow()))
+    print(cur.lastrowid)

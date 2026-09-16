@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""
+register-build --binary PATH [--buildcmds PATH] [--config NAME]
+               [--define KEY=VAL ...] [--repo DIR]        ->  build_event_id
+
+Folds into build-tpch. You already write buildcmds.txt (config opts, git HEAD,
+timestamp) and a config->binary map; this hashes the binary, reads the ELF,
+and records spec / binary / build_event.
+
+Emit the returned id as a third column in build_interleave_map.txt so it is
+known at submit time -- that is what lets the ingest collector run with no
+live state, the same property the combine manifest already relies on.
+"""
+import argparse, json, re, subprocess, sys
+from pathlib import Path
+import _common  # noqa: F401
+from corpus.db import writing, utcnow, one
+from corpus.hashing import spec_hash, text_sha256
+from corpus import elf
+
+CANONICAL = {"default_huge": {}, "default_nohuge": {"NO_HUGE_PAGES": "ON"},
+             "shard_huge": {"NUMA_SHARD": "ON"},
+             "shard_nohuge": {"NUMA_SHARD": "ON", "NO_HUGE_PAGES": "ON"}}
+
+
+def git(repo, *args):
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--binary", required=True)
+ap.add_argument("--buildcmds", help="buildcmds.txt from the tmp build dir")
+ap.add_argument("--config", help="default_huge | default_nohuge | shard_huge | shard_nohuge")
+ap.add_argument("--define", action="append", default=[], metavar="KEY=VAL",
+                help="extra cmake define, e.g. INTERLEAVE_HT=ON")
+ap.add_argument("--repo", default="/tank/alexb/swole/db-engines")
+ap.add_argument("--repo-url", default="local:db-engines")
+ap.add_argument("--allow-dirty", action="store_true")
+a = ap.parse_args()
+
+binpath = Path(a.binary)
+if not binpath.is_file():
+    sys.exit(f"no such binary: {binpath}")
+
+buildcmds_text = Path(a.buildcmds).read_text() if a.buildcmds else ""
+
+# CMake defines: canonical config as the base, buildcmds.txt scraped for any
+# -D flags, explicit --define winning over both.
+defs = dict(CANONICAL.get(a.config, {}))
+for m in re.finditer(r"-D(\w+)=(\S+)", buildcmds_text):
+    defs[m.group(1)] = m.group(2)
+for d in a.define:
+    k, _, v = d.partition("=")
+    defs[k] = v or "ON"
+
+if "NUMA_ALLOC" in defs and "NUMA_SHARD" in defs:
+    sys.exit("NUMA_ALLOC and NUMA_SHARD are mutually exclusive (CMake FATAL_ERROR)")
+
+head = git(a.repo, "rev-parse", "HEAD")
+porcelain = git(a.repo, "status", "--porcelain")
+dirty = bool(porcelain.strip())
+worktree_sha = text_sha256(porcelain + git(a.repo, "diff", "HEAD")) if dirty else None
+
+if dirty and not a.allow_dirty:
+    sys.exit(
+        f"WORKTREE DIRTY at {a.repo}. The recorded HEAD ({head[:8]}) would not "
+        f"describe the compiled bits. Commit, or pass --allow-dirty to record "
+        f"the diff hash alongside it.")
+
+if not head:
+    sys.exit(f"could not read git HEAD from {a.repo}")
+
+cxx = subprocess.run(["c++", "--version"], capture_output=True, text=True).stdout.splitlines()
+compiler_line = cxx[0] if cxx else ""
+compiler = "clang" if "clang" in compiler_line.lower() else "gcc"
+cver = (re.search(r"(\d+\.\d+\.\d+)", compiler_line) or [None, ""])[1] if compiler_line else ""
+
+sh = spec_hash(repo_url=a.repo_url, repo_sha_hex=head, repo_dirty=dirty,
+               worktree_sha_hex=worktree_sha.hex() if worktree_sha else None,
+               config_name=a.config, cmake_defs=defs, build_type="Release",
+               compiler=compiler, compiler_version=cver, cxx_flags=[])
+
+info = elf.characterize(binpath)
+now = utcnow()
+
+with writing() as conn:
+    spec_id = one(conn, "SELECT spec_id FROM build_spec WHERE spec_hash = ?", (sh,))
+    if spec_id is None:
+        spec_id = conn.execute(
+            "INSERT INTO build_spec (repo_url, repo_sha, repo_dirty, worktree_sha, "
+            "config_name, cmake_defs, build_type, compiler, compiler_version, "
+            "cxx_flags, spec_hash, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (a.repo_url, bytes.fromhex(head), int(dirty), worktree_sha, a.config,
+             json.dumps(defs), "Release", compiler, cver, "[]", sh, now)).lastrowid
+
+    binary_id = one(conn, "SELECT binary_id FROM binary WHERE content_sha256 = ?",
+                    (info["content_sha256"],))
+    if binary_id is None:
+        binary_id = conn.execute(
+            "INSERT INTO binary (content_sha256, gnu_build_id, size_bytes, "
+            "text_size_bytes, stripped, dyn_deps, first_seen_at) VALUES (?,?,?,?,?,?,?)",
+            (info["content_sha256"], info["gnu_build_id"], info["size_bytes"],
+             info["text_size_bytes"], int(bool(info["stripped"])) if info["stripped"] is not None else None,
+             json.dumps(info["dyn_deps"], default=str), now)).lastrowid
+
+    # Same recipe, same commit, different bits => codegen nondeterminism, and
+    # any performance delta across the two may be luck rather than signal.
+    others = [r[0] for r in conn.execute(
+        "SELECT DISTINCT binary_id FROM build_event WHERE spec_id = ? AND binary_id != ?",
+        (spec_id, binary_id))]
+    if others:
+        print(f"WARNING: spec {spec_id} ({a.config}) has previously produced "
+              f"{len(others)} different binary/binaries at this commit. "
+              f"Builds are not reproducible; treat cross-build deltas with care.",
+              file=sys.stderr)
+
+    ev = one(conn, "SELECT build_event_id FROM build_event WHERE spec_id = ? "
+                   "AND binary_id = ? AND binary_path = ?",
+             (spec_id, binary_id, str(binpath)))
+    if ev is None:
+        ev = conn.execute(
+            "INSERT INTO build_event (spec_id, binary_id, build_dir, binary_path, "
+            "buildcmds_text, built_at) VALUES (?,?,?,?,?,?)",
+            (spec_id, binary_id, str(binpath.parent), str(binpath),
+             buildcmds_text, now)).lastrowid
+
+print(ev)

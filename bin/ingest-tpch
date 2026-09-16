@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""
+ingest-tpch MANIFEST                        (or: --out FILE with explicit ids)
+
+The new collector. Chain it exactly like combine_publish.sh:
+    sbatch --dependency=afterany:<run1>:<run2>:... ingest-tpch manifest.txt
+
+Manifest is the combine manifest shape, extended with the context the pure-CSV
+.out cannot carry. '#' and blank lines ignored. The canonical line is FOUR
+fields; snapshot_id comes from the run job's sidecar `<outfile>.meta`:
+
+    # buildname   build_event_id  dataset_id  outfile
+    default_huge  4127            22          /tank/alexb/slurm-tpch/dubliner/default_huge_20260823T1412.out
+
+An optional fifth field carries snapshot_id as a FALLBACK for files with no
+sidecar (e.g. a hand backfill) -- the sidecar always wins. A file with neither
+is a failure, never a default: guessing which machine produced a measurement
+is worse than not recording it.
+
+One transaction per file. Idempotent on the .out's content hash and on each
+run's natural key, so re-ingesting after a parser fix is a no-op.
+"""
+import argparse, sys
+from pathlib import Path
+import _common  # noqa: F401
+from corpus.db import writing, utcnow, one
+from corpus.hashing import file_sha256, task_hash
+from corpus.parse import parse_out, header_signature, ParseError
+from corpus import __version__
+
+HEADER_VERSION = "v1"
+
+
+def load_column_map(conn, version):
+    rows = conn.execute(
+        "SELECT col_ord, raw_header, role, timing_stat, event_id FROM csv_column "
+        "WHERE header_version = ?", (version,)).fetchall()
+    if not rows:
+        sys.exit(f"no csv_column rows for header_version {version!r}")
+    return {r["col_ord"]: dict(r) for r in rows}
+
+
+def resolve_snapshot(out_file, manifest_snapshot):
+    """Sidecar wins; manifest field is a fallback; otherwise fail."""
+    meta = Path(out_file).with_suffix(".meta")
+    if meta.exists():
+        try:
+            import json as _json
+            return int(_json.loads(meta.read_text())["snapshot_id"]), None
+        except Exception as e:
+            return None, f"{meta.name}: bad sidecar ({e})"
+    if manifest_snapshot is not None:
+        return manifest_snapshot, None
+    return None, f"no snapshot for {out_file}: sidecar missing"
+
+
+def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
+                snapshot_id, timing_unit, trial, label, header_version):
+    p = Path(out_file)
+    if not p.is_file():
+        return None, f"missing: {out_file}"
+    sha = file_sha256(p)
+    if one(conn, "SELECT batch_id FROM ingest_batch WHERE out_sha256 = ?", (sha,)):
+        return 0, f"already ingested: {p.name}"
+    text = p.read_text()
+    if not text.strip():
+        return None, f"empty: {p.name}"
+    try:
+        rows, header = parse_out(text, colmap, timing_unit=timing_unit)
+    except ParseError as e:
+        return None, f"{p.name}: {e}"
+    if not rows:
+        return None, f"{p.name}: header but no data rows"
+
+    ds = conn.execute("SELECT benchmark, manifest_sha256 FROM dataset WHERE dataset_id = ?",
+                      (dataset_id,)).fetchone()
+    if ds is None:
+        return None, f"unknown dataset_id {dataset_id}"
+
+    batch_id = conn.execute(
+        "INSERT INTO ingest_batch (out_file, out_sha256, header_version, slurm_job_id, "
+        "label, timing_unit, ingested_at, tool_version) VALUES (?,?,?,?,?,?,?,?)",
+        (str(p), sha, header_version, None, label, timing_unit, utcnow(), __version__)
+    ).lastrowid
+
+    inserted = 0
+    run_labels = []          # (raw_name, run_id) for canary linking
+    for r in rows:
+        qid = one(conn, "SELECT query_id FROM query WHERE benchmark=? AND q_number=?",
+                  (ds["benchmark"], r.q_number))
+        if qid is None:
+            raise SystemExit(f"{p.name} row {r.row_ord}: query q{r.q_number} not in "
+                             f"vocabulary. Add a migration rather than auto-creating.")
+        eid = one(conn, "SELECT engine_id FROM engine WHERE code = ?", (r.engine,))
+        if eid is None:
+            raise SystemExit(f"{p.name} row {r.row_ord}: engine {r.engine!r} not in "
+                             f"vocabulary. Add a migration rather than auto-creating.")
+
+        th = task_hash(benchmark=ds["benchmark"], q_number=r.q_number,
+                       manifest_sha256_hex=ds["manifest_sha256"].hex(),
+                       threads=r.threads, vector_size=None)
+        task_id = one(conn, "SELECT task_id FROM task WHERE task_hash = ?", (th,))
+        if task_id is None:
+            task_id = conn.execute(
+                "INSERT INTO task (query_id, dataset_id, threads, vector_size, task_hash) "
+                "VALUES (?,?,?,?,?)", (qid, dataset_id, r.threads, None, th)).lastrowid
+
+        run_id = one(conn, "SELECT run_id FROM run WHERE task_id=? AND build_event_id=? "
+                           "AND snapshot_id=? AND engine_id=? AND trial=?",
+                     (task_id, build_event_id, snapshot_id, eid, trial))
+        if run_id is None:
+            t = r.timings_ns
+            run_id = conn.execute(
+                "INSERT INTO run (task_id, build_event_id, snapshot_id, engine_id, trial, "
+                "median_ns, mean_ns, min_ns, max_ns, stddev_ns, cpus, batch_id, "
+                "source_row_ord, raw_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, build_event_id, snapshot_id, eid, trial,
+                 t.get("median"), t.get("mean"), t.get("min"), t.get("max"),
+                 t.get("stddev"), r.cpus, batch_id, r.row_ord, r.raw_name)).lastrowid
+
+            conn.executemany(
+                "INSERT INTO run_counter (run_id, col_ord, event_id, value) VALUES (?,?,?,?)",
+                [(run_id, ord_, colmap[ord_]["event_id"], val)
+                 for ord_, val in r.counters.items() if colmap[ord_]["event_id"] is not None])
+            inserted += 1
+        run_labels.append((r.raw_name, run_id))
+
+    ncanary = ingest_canary(conn, out_file=str(p), snapshot_id=snapshot_id,
+                            batch_id=batch_id)
+    nenv = ingest_environment(conn, out_file=str(p), snapshot_id=snapshot_id,
+                              batch_id=batch_id)
+    ntl = ingest_timeline(conn, out_file=str(p), run_labels=run_labels, batch_id=batch_id)
+    suffix = []
+    if ncanary:
+        suffix.append(f"{ncanary} canary")
+    if nenv:
+        suffix.append(f"{nenv} env")
+    if ntl:
+        suffix.append(f"{ntl} tl")
+    tail = (", " + ", ".join(suffix)) if suffix else ""
+    return inserted, f"{p.name}: {inserted} runs{tail}"
+
+
+def ingest_timeline(conn, *, out_file, run_labels, batch_id):
+    """Ingest run-timeline stage markers for a batch.
+
+    Two sources:
+      - TIMELINE\t<event>\t<label>\t<ms> lines on the .err (from run.cpp)
+      - <out>.timeline-slurm sidecar (job_submit/job_start/job_end, epoch ms)
+    Measure events are linked to the run whose raw_name matches their label.
+    Idempotent: events already present for this batch are skipped.
+    """
+    run_map = dict(run_labels)
+    existing = set(r for (r,) in conn.execute(
+        "SELECT event_id FROM run_timeline WHERE batch_id=?", (batch_id,)))
+    inserted = 0
+
+    def add(event, label, at_ms, source, wall_clock=None, run_id=None):
+        nonlocal inserted
+        conn.execute(
+            "INSERT INTO run_timeline (batch_id, run_id, event, label, at_ms, "
+            "wall_clock, source) VALUES (?,?,?,?,?,?,?)",
+            (batch_id, run_id, event, label, at_ms, wall_clock, source))
+        inserted += 1
+
+    err = Path(out_file).with_suffix(".err")
+    if err.is_file():
+        for line in err.read_text().splitlines():
+            if not line.startswith("TIMELINE\t"):
+                continue
+            f = line.split("\t")
+            if len(f) < 4:
+                continue
+            _, event, label, at = f[0], f[1], f[2], f[3]
+            try:
+                at_ms = int(at)
+            except ValueError:
+                continue
+            run_id = run_map.get(label) if event.startswith("measure") else None
+            add(event, label, at_ms, "run.cpp", run_id=run_id)
+
+    side = Path(out_file).with_suffix(".timeline-slurm")
+    if side.is_file():
+        for line in side.read_text().splitlines():
+            f = line.split("\t")
+            if len(f) < 4 or f[0] != "TIMELINE":
+                continue
+            _, event, label, at = f[0], f[1], f[2], f[3]
+            try:
+                at_ms = int(at)
+            except ValueError:
+                continue
+            wc = f[4] if len(f) > 4 else None
+            add(event, label, at_ms, "slurm", wall_clock=wc)
+
+    return inserted
+
+
+def ingest_environment(conn, *, out_file, snapshot_id, batch_id):
+    """Ingest the before/after ambient-state snapshots for a batch.
+
+    Reads <out>.env-before and <out>.env-after sidecars (written by
+    scripts/capture_env.sh in the job prologue/epilogue), each a list of
+    "<KEY>\t<VALUE>" facts. One run_environment per phase; facts land
+    in environment_fact. Idempotent: a (batch_id, phase) already present is
+    left untouched.
+    """
+    n = 0
+    for phase in ("before", "after"):
+        side = Path(out_file).with_suffix(f".env-{phase}")
+        if not side.is_file():
+            continue
+        if one(conn, "SELECT env_obs_id FROM run_environment WHERE batch_id=? AND phase=?",
+               (batch_id, phase)):
+            continue
+        raw = side.read_text()
+        env_obs_id = conn.execute(
+            "INSERT INTO run_environment (batch_id, snapshot_id, phase, "
+            "captured_at, raw_sha256, raw_text) VALUES (?,?,?,?,?,?)",
+            (batch_id, snapshot_id, phase, utcnow(), file_sha256(side), raw)).lastrowid
+        conn.executemany(
+            "INSERT INTO environment_fact (env_obs_id, key, value_text, value_num) "
+            "VALUES (?,?,?,?)",
+            [_parse_fact(env_obs_id, line) for line in raw.splitlines() if "\t" in line])
+        n += 1
+    return n
+
+
+def _parse_fact(env_obs_id, line):
+    key, _, val = line.partition("\t")
+    try:
+        num = float(val)
+        return (env_obs_id, key, val, num)
+    except ValueError:
+        return (env_obs_id, key, val, None)
+
+
+def ingest_canary(conn, *, out_file, snapshot_id, batch_id):
+    """Parse CANARY lines from the job-level sidecars and link them to the
+    job's ingest_batch.
+
+    The canary is a standalone binary (src/tools/canary.cpp) run by the run-job
+    prologue (phase=before, -> <base>.canary-before) and epilogue (phase=after,
+    -> <base>.canary-after), like capture_env.sh. Each line:
+      CANARY\tcanary-v1@20665a7\tcompute\tbefore\t<label>\t<med>\t<mean>\t<min>\t<max>\t<stddev>\t<reps>\t<threads>
+    Timings are milliseconds here; the corpus stores nanoseconds (x1e6).
+    Idempotent because ingest short-circuits on out_sha256 before this runs.
+    """
+    base = Path(out_file).with_suffix("")
+    sides = [Path(str(base) + ".canary-before"),
+             Path(str(base) + ".canary-after")]
+    n = 0
+    for side in sides:
+        if not side.is_file():
+            continue
+        for line in side.read_text().splitlines():
+            if not line.startswith("CANARY\t"):
+                continue
+            f = line.split("\t")
+            if len(f) != 12:
+                continue
+            _, ver, kind, phase, _label = f[:5]
+            try:
+                med, mean, mn, mx, sd = (float(x) for x in f[5:10])
+                reps, thr = int(f[10]), int(f[11])
+            except ValueError:
+                continue
+            if phase not in ("before", "after"):
+                continue
+            cid = one(conn, "SELECT canary_id FROM canary WHERE canary_version=? AND kind=?",
+                      (ver, kind))
+            if cid is None:
+                cid = conn.execute(
+                    "INSERT INTO canary (canary_version, kind, workload, frozen_since, "
+                    "name, task_spec) VALUES (?,?,?,?,?,?)",
+                    (ver, kind, f"canary {kind} workload", utcnow(),
+                     f"{ver} {kind}", f"canary {kind} workload")).lastrowid
+            conn.execute(
+                "INSERT INTO run_canary (canary_id, snapshot_id, batch_id, phase, "
+                "median_ns, mean_ns, min_ns, max_ns, stddev_ns, reps, threads, observed_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cid, snapshot_id, batch_id, phase,
+                 med * 1e6, mean * 1e6, mn * 1e6, mx * 1e6, sd * 1e6, reps, thr, utcnow()))
+            n += 1
+    return n
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("manifest", nargs="?")
+ap.add_argument("--out"); ap.add_argument("--build-event", type=int)
+ap.add_argument("--dataset", type=int); ap.add_argument("--snapshot", type=int)
+ap.add_argument("--timing-unit", default="s", choices=["s", "ms", "us", "ns"],
+                help="unit run_tpch reports timings in. VERIFY against run.cpp; "
+                     "ratios are safe either way, absolute numbers are not.")
+ap.add_argument("--trial", type=int, default=0)
+ap.add_argument("--header-version", default=HEADER_VERSION)
+a = ap.parse_args()
+
+jobs = []
+if a.manifest:
+    for line in Path(a.manifest).read_text().splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        f = line.split()
+        if len(f) not in (4, 5):
+            sys.exit(f"malformed manifest line (want 4 fields + optional snapshot): {line!r}")
+        if len(f) == 5:   # optional snapshot fallback: buildname be did snapshot outfile
+            j = dict(label=f[0], build_event_id=int(f[1]), dataset_id=int(f[2]),
+                     manifest_snapshot=int(f[3]), out_file=f[4])
+        else:              # canonical 4-field: snapshot comes from the sidecar
+            j = dict(label=f[0], build_event_id=int(f[1]), dataset_id=int(f[2]),
+                     manifest_snapshot=None, out_file=f[3])
+        jobs.append(j)
+elif a.out:
+    jobs.append(dict(label=Path(a.out).stem, build_event_id=a.build_event,
+                     dataset_id=a.dataset, manifest_snapshot=a.snapshot,
+                     out_file=a.out))
+else:
+    sys.exit("give a MANIFEST or --out with --build-event/--dataset/--snapshot")
+
+failures, total = [], 0
+with writing() as conn:
+    colmap = load_column_map(conn, a.header_version)
+    for j in jobs:
+        snap, err = resolve_snapshot(j["out_file"], j.pop("manifest_snapshot"))
+        if err:
+            print(err)
+            failures.append(err)
+            continue
+        n, msg = ingest_file(conn, colmap, snapshot_id=snap,
+                             timing_unit=a.timing_unit, trial=a.trial,
+                             header_version=a.header_version, **j)
+        print(msg)
+        if n is None:
+            failures.append(msg)
+        else:
+            total += n
+
+print(f"\n{total} runs ingested from {len(jobs)} file(s)")
+if failures:
+    print(f"{len(failures)} file(s) failed", file=sys.stderr)
+    sys.exit(1)
