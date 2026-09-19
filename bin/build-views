@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+build-views [--check] [--export]
+
+Turns web/views/*.md into web/views.json, which the page fetches at load.
+
+index.html holds no view definitions at all -- adding or editing a view means
+editing markdown and rebuilding the JSON, never touching the page.
+
+Each markdown file is one view:
+
+    # thread sweep by query          <- H1 is the display name
+    tab: chart                       <- chart | table  (default: table)
+
+    Prose here becomes the button's tooltip.
+
+    ```sql
+    SELECT ...
+    ```
+
+    ```json
+    { "mark": "line", "encoding": { ... } }
+    ```
+
+Filenames order the buttons: 10-thread-sweep.md sorts before 20-scaling.md.
+The numeric prefix is not part of the name.
+
+Output is web/views.json, copied to the web directory beside index.html and
+corpus.sqlite. The page fetches it at startup; if it is missing the page still
+loads and the SQL box still works, it just has no view buttons.
+
+VALIDATION is the point of the build step. With CORPUS_DB pointing at a
+database it runs every query and checks that every field the Vega-Lite spec
+references actually comes back in the result. That catches the two mistakes
+that otherwise only show up as a blank or silently wrong chart:
+a spec naming a column the SELECT does not produce, and a GROUP BY that
+collapses series the spec expects to tell apart.
+
+  --check   validate only; touch nothing. Exit 1 on any problem.
+  --export  write any views still inlined in index.html back out as markdown.
+            One-time bootstrap; refuses to overwrite existing files.
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+VIEWS_DIR = HERE / "web" / "views"
+INDEX = HERE / "web" / "index.html"
+OUT = HERE / "web" / "views.json"
+
+FENCE = re.compile(r"^```(\w*)\s*$")
+META = re.compile(r"^([a-z_]+):\s*(.*)$")
+
+
+def parse_md(path: Path):
+    """One markdown file -> one view dict. Raises ValueError with the path."""
+    name = None
+    meta = {}
+    prose, blocks = [], {}
+    lang = None
+    buf = []
+    seen_fence = False
+
+    for lineno, raw in enumerate(path.read_text().splitlines(), 1):
+        m = FENCE.match(raw)
+        if m:
+            if lang is None:                       # opening
+                lang = (m.group(1) or "text").lower()
+                buf = []
+                seen_fence = True
+            else:                                  # closing
+                key = {"vega": "json", "vegalite": "json",
+                       "vl": "json", "js": "json"}.get(lang, lang)
+                if key in blocks:
+                    raise ValueError(f"{path.name}:{lineno}: second '{key}' block")
+                blocks[key] = "\n".join(buf)
+                lang = None
+            continue
+        if lang is not None:
+            buf.append(raw)
+            continue
+        if name is None and raw.startswith("# "):
+            name = raw[2:].strip()
+            continue
+        if not seen_fence:
+            mm = META.match(raw.strip())
+            if mm and name is not None:
+                meta[mm.group(1)] = mm.group(2).strip()
+            elif raw.strip():
+                prose.append(raw.strip())
+
+    if lang is not None:
+        raise ValueError(f"{path.name}: unclosed ``` fence")
+    if name is None:
+        name = re.sub(r"^\d+[-_]", "", path.stem).replace("-", " ")
+    tab = meta.get("tab", "table").lower()
+    if tab not in ("chart", "table"):
+        raise ValueError(f"{path.name}: tab must be 'chart' or 'table', got {tab!r}")
+    if "sql" not in blocks:
+        raise ValueError(f"{path.name}: no ```sql block")
+    if tab == "chart" and "json" not in blocks:
+        raise ValueError(f"{path.name}: chart views need a ```json spec block")
+    if tab == "table" and "json" in blocks:
+        raise ValueError(f"{path.name}: table views take no spec block "
+                         f"(set 'tab: chart'?)")
+    if "json" in blocks:
+        try:
+            json.loads(blocks["json"])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path.name}: spec is not valid JSON: {e}")
+    return {"name": name, "tab": tab, "desc": " ".join(prose),
+            "sql": blocks["sql"].strip(), "spec": blocks.get("json", "").strip(),
+            "file": path.name}
+
+
+def load_all():
+    if not VIEWS_DIR.is_dir():
+        sys.exit(f"no views directory at {VIEWS_DIR}")
+    views, problems, seen = [], [], {}
+    for p in sorted(VIEWS_DIR.glob("*.md")):
+        if p.name.upper().startswith("README"):
+            continue
+        try:
+            v = parse_md(p)
+        except ValueError as e:
+            problems.append(str(e))
+            continue
+        if v["name"] in seen:
+            problems.append(
+                f"{p.name}: duplicate view name {v['name']!r} "
+                f"(also in {seen[v['name']]}) -- names key the share URLs")
+            continue
+        seen[v["name"]] = p.name
+        views.append(v)
+    return views, problems
+
+
+def validate_sql(views):
+    """Run every query; for charts, check the spec's fields come back."""
+    db = os.environ.get("CORPUS_DB")
+    if not db or not Path(db).exists():
+        return [], ["CORPUS_DB unset or missing -- SQL and field checks skipped"]
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    problems, notes = [], []
+    for v in views:
+        try:
+            cur = con.execute(v["sql"])
+            rows = cur.fetchall()
+            cols = {d[0] for d in cur.description}
+        except sqlite3.Error as e:
+            problems.append(f"{v['file']}: SQL failed: {e}")
+            continue
+        if not rows:
+            notes.append(f"{v['file']}: query returns 0 rows "
+                         f"(fine if the corpus lacks that data yet)")
+        if v["tab"] != "chart":
+            continue
+        calc = set(re.findall(r'"as":\s*"([^"]+)"', v["spec"]))
+        fields = set(re.findall(r'"field":\s*"([^"]+)"', v["spec"])) - calc
+        missing = sorted(f for f in fields if f not in cols)
+        if missing:
+            problems.append(
+                f"{v['file']}: spec references {missing} but the query returns "
+                f"{sorted(cols)}")
+    return problems, notes
+
+
+def render(views):
+    """The document the page fetches. Order is button order."""
+    return {
+        "generated_by": "bin/build-views",
+        "views": [
+            {k: v[k] for k in ("name", "tab", "sql", "spec", "desc") if v.get(k)}
+            for v in views
+        ],
+    }
+
+
+def write_json(doc):
+    OUT.write_text(json.dumps(doc, indent=1) + "\n")
+
+
+def export():
+    """Bootstrap: pull any still-inlined views back out into markdown."""
+    html = INDEX.read_text()
+    if "const CHART_VIEWS" not in html:
+        sys.exit("index.html has no inlined views -- nothing to export. "
+                 "The views already live in web/views/*.md.")
+    tv = json.loads(re.search(r"const TABLE_VIEWS = (\{.*?\n\});", html, re.S).group(1))
+    cv = json.loads(re.search(r"const CHART_VIEWS = (\{.*?\n\});", html, re.S).group(1))
+    VIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    n = 0
+    order = 0
+    for name, d in list(cv.items()) + list(tv.items()):
+        order += 10
+        is_chart = isinstance(d, dict)
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        p = VIEWS_DIR / f"{order:03d}-{slug}.md"
+        if p.exists():
+            print(f"  skip (exists) {p.name}")
+            continue
+        body = [f"# {name}", f"tab: {'chart' if is_chart else 'table'}", "",
+                "```sql", (d["sql"] if is_chart else d).strip(), "```"]
+        if is_chart:
+            body += ["", "```json", d["spec"].strip(), "```"]
+        p.write_text("\n".join(body) + "\n")
+        n += 1
+    print(f"  wrote {n} file(s) to {VIEWS_DIR}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--check", action="store_true", help="validate only")
+    ap.add_argument("--export", action="store_true",
+                    help="dump inlined views to markdown (bootstrap)")
+    a = ap.parse_args()
+
+    if a.export:
+        export()
+        return 0
+
+    views, problems = load_all()
+    sql_problems, notes = validate_sql(views)
+    problems += sql_problems
+
+    for v in views:
+        print(f"  {v['tab']:5} {v['name']:34} {v['file']}")
+    for n in notes:
+        print(f"  note: {n}")
+
+    if problems:
+        print("\nPROBLEMS:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 1
+    if not views:
+        print("\nno views found", file=sys.stderr)
+        return 1
+
+    n_chart = sum(1 for v in views if v["tab"] == "chart")
+    if a.check:
+        print(f"\nOK: {len(views)} views ({n_chart} chart, "
+              f"{len(views)-n_chart} table); nothing written")
+        return 0
+    write_json(render(views))
+    print(f"\nwrote {len(views)} views ({n_chart} chart, "
+          f"{len(views)-n_chart} table) to {OUT.relative_to(HERE)} "
+          f"({OUT.stat().st_size:,} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

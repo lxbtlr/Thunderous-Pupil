@@ -1,0 +1,136 @@
+{
+ "generated_by": "bin/build-views",
+ "views": [
+  {
+   "name": "1. bars: sf1, 1 thread",
+   "tab": "chart",
+   "sql": "-- ==========================================================================\n-- CONTROLLING WHICH BUILD IS PLOTTED\n--\n-- By default this includes EVERY build_event. If you have more than one\n-- config (default_huge, shard_nohuge, ...) each query/engine/machine will\n-- appear once per build and the bars will be averaged together, which is\n-- almost never what you want.\n--\n-- Pick one:\n--   a) one named config  -> uncomment the config_name line\n--   b) one exact build   -> uncomment the build_event_id line, get ids from\n--                           the 'builds' table view or: vocab builds\n--   c) latest build only -> uncomment the sub-select line\n--   d) keep them all and compare -> leave commented, and change the chart's\n--      \"column\" encoding from node to config_name (or add a row facet)\n-- ==========================================================================\nSELECT m.stable_key           AS node,\n       q.label                AS query,\n       q.q_number,\n       e.code                 AS engine,\n       bs.config_name,\n       be.build_event_id,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms,\n       COUNT(*)                         AS n_runs\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND d.sf_label = 'sf1'\n  AND t.threads  = 1\n  AND q.q_number <> 5          -- q5 excluded; delete this line to include it\n  -- AND bs.config_name = 'default_huge'\n  -- AND be.build_event_id = 1\n  -- AND be.build_event_id = (SELECT MAX(build_event_id) FROM build_event)\nGROUP BY m.machine_id, q.query_id, e.engine_id, be.build_event_id\nORDER BY m.stable_key, q.q_number, e.code",
+   "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 300,\n  \"height\": 300,\n  \"mark\": {\n    \"type\": \"bar\"\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    },\n    \"y\": {\n      \"field\": \"median_ms\",\n      \"type\": \"quantitative\",\n      \"title\": \"median ms\"\n    },\n    \"xOffset\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"engine\"\n      },\n      {\n        \"field\": \"config_name\"\n      },\n      {\n        \"field\": \"median_ms\"\n      },\n      {\n        \"field\": \"n_runs\"\n      }\n    ],\n    \"opacity\": {\n      \"field\": \"config_name\",\n      \"type\": \"nominal\",\n      \"title\": \"config\",\n      \"scale\": {\n        \"range\": [\n          1.0,\n          0.55,\n          0.3\n        ]\n      }\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+  },
+  {
+   "name": "2. bars: best time in corpus",
+   "tab": "chart",
+   "sql": "-- Best (minimum) observed time for each engine x query x machine.\n--\n-- NOTE ON SCOPE: as written this minimises across EVERYTHING else -- every\n-- scale factor, thread count, build and trial in the corpus. Since sf1 is\n-- always faster than sf100, the winner is effectively \"sf1 at its best thread\n-- count\", which may not be the comparison you want.\n--\n-- To hold the data size fixed and take the best thread count (usually the\n-- intended reading), uncomment the sf_label line.\n-- To restrict to one build, uncomment the config_name line.\n--\n-- Unlike the other views this one deliberately minimises ACROSS builds and\n-- scale factors -- that is what 'best in corpus' means. config_name is\n-- therefore omitted from the SELECT rather than left as a bare column that\n-- would show an arbitrary build's name next to another build's number.\nSELECT m.stable_key AS node,\n       q.label      AS query,\n       q.q_number,\n       e.code       AS engine,\n       ROUND(MIN(r.min_ns) / 1e6, 3) AS best_ms,\n       COUNT(*)                      AS runs_considered,\n       MIN(t.threads)                AS threads_at_min\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND r.min_ns IS NOT NULL\n  AND q.q_number <> 5          -- q5 excluded; delete this line to include it\n  -- AND d.sf_label = 'sf1'\n  -- AND bs.config_name = 'default_huge'\nGROUP BY m.machine_id, q.query_id, e.engine_id\nORDER BY m.stable_key, q.q_number, e.code",
+   "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 300,\n  \"height\": 300,\n  \"mark\": {\n    \"type\": \"bar\"\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    },\n    \"y\": {\n      \"field\": \"best_ms\",\n      \"type\": \"quantitative\",\n      \"title\": \"best ms (min over corpus)\"\n    },\n    \"xOffset\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"engine\"\n      },\n      {\n        \"field\": \"best_ms\"\n      },\n      {\n        \"field\": \"threads_at_min\"\n      },\n      {\n        \"field\": \"runs_considered\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+  },
+  {
+   "name": "3. thread sweep by query",
+   "tab": "chart",
+   "sql": "-- Runtime against thread count. One row per machine, one column per query,\n-- one colour per engine. All measured thread counts.\n--\n-- The spec sets resolve.scale.x = independent, so each panel gets its own\n-- x axis. dubliner sweeps to 384 threads, burrata only to 80; a shared axis\n-- would pad burrata's panels with empty space out to 384.\n--\n-- GROUPING: every non-aggregate column in the SELECT is also in the GROUP BY.\n-- SQLite allows a bare column in an aggregate query and just picks an\n-- arbitrary row for it, so dropping one silently AVERAGES its series together\n-- and mislabels the result. That is how you get one line per engine when you\n-- expected one per (engine, build, scale factor).\n--\n-- As written you get one line per (engine, build, scale factor):\n--   colour  = engine        dash = scale factor\n--   opacity = config        detail keeps separate builds apart\n-- That is a lot at once. Pin a dimension with one of the filters below to\n-- thin it out -- fixing the scale factor is usually the first thing to do.\nSELECT m.stable_key       AS node,\n       q.label            AS query,\n       q.q_number,\n       e.code             AS engine,\n       bs.config_name,\n       be.build_event_id,\n       d.sf_label,\n       d.scale_factor,\n       t.threads,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms,\n       COUNT(*)                         AS n_runs\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND q.q_number <> 5          -- q5 excluded; delete this line to include it\n  -- AND d.sf_label = 'sf10'\n  -- AND bs.config_name = 'default_huge'\n  -- AND be.build_event_id = (SELECT MAX(build_event_id) FROM build_event)\nGROUP BY m.machine_id, q.query_id, e.engine_id,\n         be.build_event_id, d.dataset_id, t.threads\nORDER BY m.stable_key, q.q_number, e.code, d.scale_factor, t.threads",
+   "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"column\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    }\n  },\n  \"spec\": {\n    \"width\": 190,\n    \"height\": 160,\n    \"mark\": {\n      \"type\": \"line\",\n      \"point\": true\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"threads\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\",\n          \"base\": 2\n        },\n        \"title\": \"threads\"\n      },\n      \"y\": {\n        \"field\": \"median_ms\",\n        \"type\": \"quantitative\",\n        \"title\": \"median ms\"\n      },\n      \"color\": {\n        \"field\": \"engine\",\n        \"type\": \"nominal\"\n      },\n      \"strokeDash\": {\n        \"field\": \"sf_label\",\n        \"type\": \"nominal\",\n        \"title\": \"scale\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"query\"\n        },\n        {\n          \"field\": \"engine\"\n        },\n        {\n          \"field\": \"config_name\"\n        },\n        {\n          \"field\": \"sf_label\"\n        },\n        {\n          \"field\": \"threads\"\n        },\n        {\n          \"field\": \"median_ms\"\n        },\n        {\n          \"field\": \"n_runs\"\n        }\n      ],\n      \"opacity\": {\n        \"field\": \"config_name\",\n        \"type\": \"nominal\",\n        \"title\": \"config\",\n        \"scale\": {\n          \"range\": [\n            1.0,\n            0.55,\n            0.3\n          ]\n        }\n      },\n      \"detail\": {\n        \"field\": \"build_event_id\",\n        \"type\": \"nominal\"\n      }\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  },\n  \"resolve\": {\n    \"scale\": {\n      \"x\": \"independent\"\n    }\n  }\n}"
+  },
+  {
+   "name": "4. scaling curves (2^k only)",
+   "tab": "chart",
+   "sql": "-- Log-log scaling. A straight line of slope -1 is perfect scaling;\n-- flattening is where adding threads stops paying.\n--\n-- GROUPING: every non-aggregate column in the SELECT is also in the GROUP BY.\n-- SQLite allows a bare column in an aggregate query and just picks an\n-- arbitrary row for it, so dropping one silently AVERAGES its series together\n-- and mislabels the result. That is how you get one line per engine when you\n-- expected one per (engine, build, scale factor).\n--\n-- Restricted to power-of-two thread counts via (threads & (threads-1)) = 0,\n-- which is true only when exactly one bit is set. Drop that line to include\n-- every measured thread count.\nSELECT m.stable_key AS node,\n       q.label      AS query,\n       q.q_number,\n       e.code       AS engine,\n       bs.config_name,\n       d.sf_label,\n       be.build_event_id,\n       t.threads,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms,\n       COUNT(*)                         AS n_runs\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND (t.threads & (t.threads - 1)) = 0     -- powers of two only\n  AND q.q_number <> 5          -- q5 excluded; delete this line to include it\n  -- AND bs.config_name = 'default_huge'\n  -- AND d.sf_label = 'sf10'\nGROUP BY m.machine_id, q.query_id, e.engine_id,\n         be.build_event_id, d.dataset_id, t.threads\nORDER BY m.stable_key, q.q_number, t.threads",
+   "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"column\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    }\n  },\n  \"spec\": {\n    \"width\": 190,\n    \"height\": 165,\n    \"mark\": {\n      \"type\": \"line\",\n      \"point\": true\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"threads\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\",\n          \"base\": 2\n        },\n        \"title\": \"threads\"\n      },\n      \"y\": {\n        \"field\": \"median_ms\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\"\n        },\n        \"title\": \"median ms\"\n      },\n      \"color\": {\n        \"field\": \"engine\",\n        \"type\": \"nominal\"\n      },\n      \"strokeDash\": {\n        \"field\": \"sf_label\",\n        \"type\": \"nominal\",\n        \"title\": \"scale\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"query\"\n        },\n        {\n          \"field\": \"engine\"\n        },\n        {\n          \"field\": \"config_name\"\n        },\n        {\n          \"field\": \"sf_label\"\n        },\n        {\n          \"field\": \"threads\"\n        },\n        {\n          \"field\": \"median_ms\"\n        },\n        {\n          \"field\": \"n_runs\"\n        }\n      ],\n      \"opacity\": {\n        \"field\": \"config_name\",\n        \"type\": \"nominal\",\n        \"title\": \"config\",\n        \"scale\": {\n          \"range\": [\n            1.0,\n            0.55,\n            0.3\n          ]\n        }\n      },\n      \"detail\": {\n        \"field\": \"build_event_id\",\n        \"type\": \"nominal\"\n      }\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
+  },
+  {
+   "name": "engine share by machine",
+   "tab": "chart",
+   "sql": "-- engine_duel already carries cpu_vendor; joining machine_snapshot again\n-- makes the column ambiguous.\nSELECT node, cpu_vendor, query, winner, COUNT(*) AS cells\nFROM engine_duel\nWHERE pair = 'h vs v'\nGROUP BY snapshot_id, query_id, winner\nORDER BY node, query",
+   "spec": "{\n  \"width\": 300, \"height\": 260,\n  \"mark\": \"bar\",\n  \"encoding\": {\n    \"x\": {\"field\": \"query\", \"type\": \"nominal\", \"title\": null},\n    \"y\": {\"field\": \"cells\", \"type\": \"quantitative\", \"stack\": \"normalize\",\n          \"title\": \"share of cells\"},\n    \"color\": {\"field\": \"winner\", \"type\": \"nominal\",\n              \"scale\": {\"domain\": [\"h\", \"v\", \"tie\"],\n                        \"range\": [\"#0b5\", \"#c50\", \"#888\"]}},\n    \"column\": {\"field\": \"node\", \"type\": \"nominal\", \"title\": null},\n    \"tooltip\": [{\"field\": \"node\"}, {\"field\": \"query\"},\n                {\"field\": \"winner\"}, {\"field\": \"cells\"}]\n  }\n}",
+   "desc": "Stacked share of cells each engine wins, per machine. Ties are their own band, so a tall grey band means the corpus cannot separate the engines at all there."
+  },
+  {
+   "name": "all runs",
+   "tab": "table",
+   "sql": "SELECT * FROM v_runs\nORDER BY node, config_name, sf_label, query, threads, engine"
+  },
+  {
+   "name": "h vs v",
+   "tab": "table",
+   "sql": "-- z is the effect size in units of each cell's own noise.\n-- |z| < 2 means the difference is not resolvable at this precision.\nSELECT node, config_name, sf_label, query, threads,\n       ROUND(h_median_ns/1e6, 3) AS h_ms,\n       ROUND(v_median_ns/1e6, 3) AS v_ms,\n       ROUND(h_over_v, 3)  AS h_over_v,\n       ROUND(rel_diff, 4)  AS rel_diff,\n       ROUND(pooled_cv, 4) AS pooled_cv,\n       ROUND(z, 2)         AS z,\n       winner\nFROM engine_pair\nORDER BY node, query, scale_factor, threads"
+  },
+  {
+   "name": "engine duel (incl. b)",
+   "tab": "table",
+   "sql": "-- All unordered engine pairs, including 'b' (q6 branching), which\n-- engine_pair cannot see. 'winner' names an engine code.\nSELECT node, cpu_vendor, config_name, pair, query, sf_label, threads,\n       ROUND(a_median_ns/1e6, 3) AS a_ms,\n       ROUND(b_median_ns/1e6, 3) AS b_ms,\n       ROUND(a_over_b, 3) AS a_over_b,\n       ROUND(z, 2) AS z, winner\nFROM engine_duel\nORDER BY node, query, pair, threads"
+  },
+  {
+   "name": "win rate / build",
+   "tab": "table",
+   "sql": "-- Grouped by (binary, machine) since 0019: pooling an ARM result with a\n-- Xeon one was the bug that view fixed.\nSELECT * FROM v_win_rate_by_build ORDER BY node, config_name"
+  },
+  {
+   "name": "win rate / query",
+   "tab": "table",
+   "sql": "SELECT * FROM v_win_rate_by_build_query\nORDER BY node, config_name, q_number"
+  },
+  {
+   "name": "win rate long",
+   "tab": "table",
+   "sql": "-- One row per (build, machine, query, engine). Ties appear on BOTH engine\n-- rows, so wins+ties will not sum to cells across the pair -- a tie belongs\n-- to the cell, not to either engine.\nSELECT * FROM v_win_rate_long ORDER BY node, config_name, q_number, engine"
+  },
+  {
+   "name": "duel win rate",
+   "tab": "table",
+   "sql": "SELECT * FROM v_duel_win_rate ORDER BY node, pair, query"
+  },
+  {
+   "name": "balanced panel",
+   "tab": "table",
+   "sql": "-- Only cells every build has, computed WITHIN a machine. If cells_used\n-- collapses against cells_total, the panel is too thin to conclude anything\n-- -- which is itself the finding.\nSELECT * FROM v_win_rate_balanced ORDER BY node, config_name"
+  },
+  {
+   "name": "imbalance",
+   "tab": "table",
+   "sql": "-- Read BEFORE comparing builds. A build missing a scale factor is not\n-- comparable to one that has it; the crossover moves with data size.\nSELECT * FROM v_build_balance ORDER BY node, config_name, scale_factor"
+  },
+  {
+   "name": "crossover by sf",
+   "tab": "table",
+   "sql": "-- The shape the model has to predict, seen directly.\nSELECT * FROM v_win_rate_by_sf\nORDER BY node, config_name, scale_factor, query, threads"
+  },
+  {
+   "name": "coverage",
+   "tab": "table",
+   "sql": "SELECT m.stable_key AS node, bs.config_name, d.sf_label,\n       COUNT(DISTINCT t.query_id) AS queries,\n       COUNT(DISTINCT t.threads)  AS thread_counts,\n       COUNT(DISTINCT r.engine_id) AS engines,\n       COUNT(*) AS runs,\n       MAX(ib.ingested_at) AS last_ingest\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN ingest_batch ib     ON ib.batch_id = r.batch_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nGROUP BY m.machine_id, bs.config_name, d.dataset_id\nORDER BY node, config_name, d.scale_factor"
+  },
+  {
+   "name": "orphan cells",
+   "tab": "table",
+   "sql": "-- Cells measured for fewer than two engines: worth nothing for comparison.\n-- Expect rows mid-campaign; only meaningful once a batch finishes.\nSELECT m.stable_key AS node, bs.config_name, d.sf_label, q.label AS query,\n       t.threads, GROUP_CONCAT(e.code) AS engines_present, COUNT(*) AS n\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\nGROUP BY r.task_id, r.build_event_id, r.snapshot_id, r.trial\nHAVING COUNT(DISTINCT r.engine_id) < 2"
+  },
+  {
+   "name": "noisy",
+   "tab": "table",
+   "sql": "-- This sets your tie threshold. If typical cv is 0.005 the |z|<2 band is\n-- about 1%; at 0.03 it is 6%. It differs by machine.\nSELECT node, config_name, sf_label, query, engine, threads, cv, median_ms\nFROM v_runs\nWHERE cv IS NOT NULL AND quality = 'clean' AND cv > 0.02\nORDER BY cv DESC LIMIT 200"
+  },
+  {
+   "name": "counters",
+   "tab": "table",
+   "sql": "-- Raw counters, one row per run. Within a single vendor only: ARM's nearest\n-- LLC-miss event does not count what Intel's counts. Use the\n-- 'counters cross-vendor' view when spanning burrata and an x86 node.\nSELECT * FROM v_run_counters_wide\nORDER BY config_name, sf_label, query, threads"
+  },
+  {
+   "name": "counters cross-vendor",
+   "tab": "table",
+   "sql": "-- Only counters that mean the same thing on ARM and x86.\nSELECT r.node, r.config_name, r.sf_label, r.query, r.engine, r.threads,\n       r.median_ms,\n       MAX(CASE WHEN c.event='cycles'       THEN c.value END) AS cycles,\n       MAX(CASE WHEN c.event='instructions' THEN c.value END) AS instructions,\n       MAX(CASE WHEN c.event='task_clock'   THEN c.value END) AS task_clock,\n       ROUND(MAX(CASE WHEN c.event='instructions' THEN c.value END) /\n             NULLIF(MAX(CASE WHEN c.event='cycles' THEN c.value END),0), 3) AS ipc\nFROM v_runs r\nJOIN v_counters_comparable c ON c.run_id = r.run_id\nGROUP BY r.run_id\nORDER BY r.node, r.query, r.threads"
+  },
+  {
+   "name": "machines",
+   "tab": "table",
+   "sql": "SELECT m.stable_key AS node, m.partition, ms.snapshot_id,\n       ms.cpu_vendor, ms.cpu_model, ms.cores_physical, ms.threads_logical,\n       ms.numa_nodes, ms.l3_bytes, ms.kernel_version, ms.observed_from\nFROM machine_snapshot ms\nJOIN machine m ON m.machine_id = ms.machine_id\nORDER BY node, ms.observed_from DESC"
+  },
+  {
+   "name": "builds",
+   "tab": "table",
+   "sql": "SELECT be.build_event_id, bs.config_name,\n       substr(hex(bs.repo_sha),1,8) AS head, bs.repo_dirty, bs.cmake_defs,\n       substr(hex(b.content_sha256),1,12) AS binary_sha, be.built_at\nFROM build_event be\nJOIN build_spec bs ON bs.spec_id = be.spec_id\nJOIN binary b      ON b.binary_id = be.binary_id\nORDER BY be.built_at DESC"
+  },
+  {
+   "name": "headers",
+   "tab": "table",
+   "sql": "-- Counter columns each header layout supplies. burrata's PMU exposes fewer\n-- events, so its .out is narrower than v4's.\nSELECT * FROM v_header_expectations ORDER BY header_version"
+  },
+  {
+   "name": "reproducibility",
+   "tab": "table",
+   "sql": "-- Same recipe, same commit, different bits: cross-build deltas may be\n-- codegen luck rather than signal.\nSELECT * FROM spec_reproducibility"
+  },
+  {
+   "name": "schema",
+   "tab": "table",
+   "sql": "SELECT type, name, sql FROM sqlite_master\nWHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+  }
+ ]
+}

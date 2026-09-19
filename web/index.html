@@ -95,48 +95,28 @@
 // Override with #db=name in the URL.
 const DB_CANDIDATES = ["corpus.sqlite", "corpus.db", "publish.sqlite"];
 
-const TABLE_VIEWS = {
- "all runs": "SELECT * FROM v_runs\nORDER BY node, config_name, sf_label, query, threads, engine",
- "h vs v": "-- z is the effect size in units of each cell's own noise.\n-- |z| < 2 means the difference is not resolvable at this precision.\nSELECT node, config_name, sf_label, query, threads,\n       ROUND(h_median_ns/1e6, 3) AS h_ms,\n       ROUND(v_median_ns/1e6, 3) AS v_ms,\n       ROUND(h_over_v, 3)  AS h_over_v,\n       ROUND(rel_diff, 4)  AS rel_diff,\n       ROUND(pooled_cv, 4) AS pooled_cv,\n       ROUND(z, 2)         AS z,\n       winner\nFROM engine_pair\nORDER BY node, query, scale_factor, threads",
- "engine duel (incl. b)": "-- All unordered engine pairs, including 'b' (q6 branching), which\n-- engine_pair cannot see. 'winner' names an engine code.\nSELECT node, cpu_vendor, config_name, pair, query, sf_label, threads,\n       ROUND(a_median_ns/1e6, 3) AS a_ms,\n       ROUND(b_median_ns/1e6, 3) AS b_ms,\n       ROUND(a_over_b, 3) AS a_over_b,\n       ROUND(z, 2) AS z, winner\nFROM engine_duel\nORDER BY node, query, pair, threads",
- "win rate / build": "-- Grouped by (binary, machine) since 0019: pooling an ARM result with a\n-- Xeon one was the bug that view fixed.\nSELECT * FROM v_win_rate_by_build ORDER BY node, config_name",
- "win rate / query": "SELECT * FROM v_win_rate_by_build_query\nORDER BY node, config_name, q_number",
- "win rate long": "-- One row per (build, machine, query, engine). Ties appear on BOTH engine\n-- rows, so wins+ties will not sum to cells across the pair -- a tie belongs\n-- to the cell, not to either engine.\nSELECT * FROM v_win_rate_long ORDER BY node, config_name, q_number, engine",
- "duel win rate": "SELECT * FROM v_duel_win_rate ORDER BY node, pair, query",
- "balanced panel": "-- Only cells every build has, computed WITHIN a machine. If cells_used\n-- collapses against cells_total, the panel is too thin to conclude anything\n-- -- which is itself the finding.\nSELECT * FROM v_win_rate_balanced ORDER BY node, config_name",
- "imbalance": "-- Read BEFORE comparing builds. A build missing a scale factor is not\n-- comparable to one that has it; the crossover moves with data size.\nSELECT * FROM v_build_balance ORDER BY node, config_name, scale_factor",
- "crossover by sf": "-- The shape the model has to predict, seen directly.\nSELECT * FROM v_win_rate_by_sf\nORDER BY node, config_name, scale_factor, query, threads",
- "coverage": "SELECT m.stable_key AS node, bs.config_name, d.sf_label,\n       COUNT(DISTINCT t.query_id) AS queries,\n       COUNT(DISTINCT t.threads)  AS thread_counts,\n       COUNT(DISTINCT r.engine_id) AS engines,\n       COUNT(*) AS runs,\n       MAX(ib.ingested_at) AS last_ingest\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN ingest_batch ib     ON ib.batch_id = r.batch_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nGROUP BY m.machine_id, bs.config_name, d.dataset_id\nORDER BY node, config_name, d.scale_factor",
- "orphan cells": "-- Cells measured for fewer than two engines: worth nothing for comparison.\n-- Expect rows mid-campaign; only meaningful once a batch finishes.\nSELECT m.stable_key AS node, bs.config_name, d.sf_label, q.label AS query,\n       t.threads, GROUP_CONCAT(e.code) AS engines_present, COUNT(*) AS n\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\nGROUP BY r.task_id, r.build_event_id, r.snapshot_id, r.trial\nHAVING COUNT(DISTINCT r.engine_id) < 2",
- "noisy": "-- This sets your tie threshold. If typical cv is 0.005 the |z|<2 band is\n-- about 1%; at 0.03 it is 6%. It differs by machine.\nSELECT node, config_name, sf_label, query, engine, threads, cv, median_ms\nFROM v_runs\nWHERE cv IS NOT NULL AND quality = 'clean' AND cv > 0.02\nORDER BY cv DESC LIMIT 200",
- "counters": "-- Raw counters, one row per run. Within a single vendor only: ARM's nearest\n-- LLC-miss event does not count what Intel's counts. Use the\n-- 'counters cross-vendor' view when spanning burrata and an x86 node.\nSELECT * FROM v_run_counters_wide\nORDER BY config_name, sf_label, query, threads",
- "counters cross-vendor": "-- Only counters that mean the same thing on ARM and x86.\nSELECT r.node, r.config_name, r.sf_label, r.query, r.engine, r.threads,\n       r.median_ms,\n       MAX(CASE WHEN c.event='cycles'       THEN c.value END) AS cycles,\n       MAX(CASE WHEN c.event='instructions' THEN c.value END) AS instructions,\n       MAX(CASE WHEN c.event='task_clock'   THEN c.value END) AS task_clock,\n       ROUND(MAX(CASE WHEN c.event='instructions' THEN c.value END) /\n             NULLIF(MAX(CASE WHEN c.event='cycles' THEN c.value END),0), 3) AS ipc\nFROM v_runs r\nJOIN v_counters_comparable c ON c.run_id = r.run_id\nGROUP BY r.run_id\nORDER BY r.node, r.query, r.threads",
- "machines": "SELECT m.stable_key AS node, m.partition, ms.snapshot_id,\n       ms.cpu_vendor, ms.cpu_model, ms.cores_physical, ms.threads_logical,\n       ms.numa_nodes, ms.l3_bytes, ms.kernel_version, ms.observed_from\nFROM machine_snapshot ms\nJOIN machine m ON m.machine_id = ms.machine_id\nORDER BY node, ms.observed_from DESC",
- "builds": "SELECT be.build_event_id, bs.config_name,\n       substr(hex(bs.repo_sha),1,8) AS head, bs.repo_dirty, bs.cmake_defs,\n       substr(hex(b.content_sha256),1,12) AS binary_sha, be.built_at\nFROM build_event be\nJOIN build_spec bs ON bs.spec_id = be.spec_id\nJOIN binary b      ON b.binary_id = be.binary_id\nORDER BY be.built_at DESC",
- "headers": "-- Counter columns each header layout supplies. burrata's PMU exposes fewer\n-- events, so its .out is narrower than v4's.\nSELECT * FROM v_header_expectations ORDER BY header_version",
- "reproducibility": "-- Same recipe, same commit, different bits: cross-build deltas may be\n-- codegen luck rather than signal.\nSELECT * FROM spec_reproducibility",
- "schema": "SELECT type, name, sql FROM sqlite_master\nWHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-};
+// Views are NOT defined here. They are built from web/views/*.md by
+// bin/build-views into views.json, which is fetched at startup. Adding or
+// editing a view means editing markdown and rebuilding, never touching this
+// file.
+let TABLE_VIEWS = {};      // name -> sql
+let CHART_VIEWS = {};      // name -> {sql, spec, desc?}
+let TABLE_DESC  = {};      // name -> tooltip
+let VIEWS_URL   = "views.json";
 
-const CHART_VIEWS = {
- "1. bars: sf1, 1 thread": {
-  "sql": "-- ==========================================================================\n-- CONTROLLING WHICH BUILD IS PLOTTED\n--\n-- By default this includes EVERY build_event. If you have more than one\n-- config (default_huge, shard_nohuge, ...) each query/engine/machine will\n-- appear once per build and the bars will be averaged together, which is\n-- almost never what you want.\n--\n-- Pick one:\n--   a) one named config  -> uncomment the config_name line\n--   b) one exact build   -> uncomment the build_event_id line, get ids from\n--                           the 'builds' table view or: vocab builds\n--   c) latest build only -> uncomment the sub-select line\n--   d) keep them all and compare -> leave commented, and change the chart's\n--      \"column\" encoding from node to config_name (or add a row facet)\n-- ==========================================================================\nSELECT m.stable_key           AS node,\n       q.label                AS query,\n       q.q_number,\n       e.code                 AS engine,\n       bs.config_name,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND d.sf_label = 'sf1'\n  AND t.threads  = 1\n  -- AND bs.config_name = 'default_huge'\n  -- AND be.build_event_id = 1\n  -- AND be.build_event_id = (SELECT MAX(build_event_id) FROM build_event)\nGROUP BY m.machine_id, q.query_id, e.engine_id\nORDER BY m.stable_key, q.q_number, e.code",
-  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 300,\n  \"height\": 300,\n  \"mark\": {\n    \"type\": \"bar\"\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    },\n    \"y\": {\n      \"field\": \"median_ms\",\n      \"type\": \"quantitative\",\n      \"title\": \"median ms\"\n    },\n    \"xOffset\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"engine\"\n      },\n      {\n        \"field\": \"config_name\"\n      },\n      {\n        \"field\": \"median_ms\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
- },
- "2. bars: best time in corpus": {
-  "sql": "-- Best (minimum) observed time for each engine x query x machine.\n--\n-- NOTE ON SCOPE: as written this minimises across EVERYTHING else -- every\n-- scale factor, thread count, build and trial in the corpus. Since sf1 is\n-- always faster than sf100, the winner is effectively \"sf1 at its best thread\n-- count\", which may not be the comparison you want.\n--\n-- To hold the data size fixed and take the best thread count (usually the\n-- intended reading), uncomment the sf_label line.\n-- To restrict to one build, uncomment the config_name line.\nSELECT m.stable_key AS node,\n       q.label      AS query,\n       q.q_number,\n       e.code       AS engine,\n       ROUND(MIN(r.min_ns) / 1e6, 3) AS best_ms,\n       COUNT(*)                      AS runs_considered,\n       MIN(t.threads)                AS threads_at_min\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND r.min_ns IS NOT NULL\n  -- AND d.sf_label = 'sf1'\n  -- AND bs.config_name = 'default_huge'\nGROUP BY m.machine_id, q.query_id, e.engine_id\nORDER BY m.stable_key, q.q_number, e.code",
-  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"width\": 300,\n  \"height\": 300,\n  \"mark\": {\n    \"type\": \"bar\"\n  },\n  \"encoding\": {\n    \"x\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    },\n    \"y\": {\n      \"field\": \"best_ms\",\n      \"type\": \"quantitative\",\n      \"title\": \"best ms (min over corpus)\"\n    },\n    \"xOffset\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"color\": {\n      \"field\": \"engine\",\n      \"type\": \"nominal\"\n    },\n    \"column\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"tooltip\": [\n      {\n        \"field\": \"node\"\n      },\n      {\n        \"field\": \"query\"\n      },\n      {\n        \"field\": \"engine\"\n      },\n      {\n        \"field\": \"best_ms\"\n      },\n      {\n        \"field\": \"threads_at_min\"\n      },\n      {\n        \"field\": \"runs_considered\"\n      }\n    ]\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
- },
- "3. thread sweep by query": {
-  "sql": "-- Runtime against thread count. One subplot per query, one colour per\n-- engine. All measured thread counts, not just powers of two.\n--\n-- Fix the data size and the build unless you want them overlaid:\n--   AND d.sf_label = 'sf10'\n--   AND bs.config_name = 'default_huge'\nSELECT m.stable_key AS node,\n       q.label      AS query,\n       q.q_number,\n       e.code       AS engine,\n       bs.config_name,\n       d.sf_label,\n       t.threads,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  -- AND d.sf_label = 'sf10'\n  -- AND bs.config_name = 'default_huge'\nGROUP BY m.machine_id, q.query_id, e.engine_id, t.threads\nORDER BY q.q_number, t.threads",
-  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"field\": \"query\",\n    \"type\": \"nominal\",\n    \"columns\": 3,\n    \"sort\": {\n      \"field\": \"q_number\"\n    },\n    \"title\": null\n  },\n  \"spec\": {\n    \"width\": 210,\n    \"height\": 180,\n    \"mark\": {\n      \"type\": \"line\",\n      \"point\": true\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"threads\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\",\n          \"base\": 2\n        },\n        \"title\": \"threads\"\n      },\n      \"y\": {\n        \"field\": \"median_ms\",\n        \"type\": \"quantitative\",\n        \"title\": \"median ms\"\n      },\n      \"color\": {\n        \"field\": \"engine\",\n        \"type\": \"nominal\"\n      },\n      \"strokeDash\": {\n        \"field\": \"node\",\n        \"type\": \"nominal\",\n        \"title\": \"node\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"query\"\n        },\n        {\n          \"field\": \"engine\"\n        },\n        {\n          \"field\": \"threads\"\n        },\n        {\n          \"field\": \"median_ms\"\n        }\n      ]\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
- },
- "4. scaling curves (2^k only)": {
-  "sql": "-- Log-log scaling. A straight line of slope -1 is perfect scaling;\n-- flattening is where adding threads stops paying.\n--\n-- Restricted to power-of-two thread counts via (threads & (threads-1)) = 0,\n-- which is true only when exactly one bit is set. Drop that line to include\n-- every measured thread count.\nSELECT m.stable_key AS node,\n       q.label      AS query,\n       q.q_number,\n       e.code       AS engine,\n       bs.config_name,\n       d.sf_label,\n       t.threads,\n       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms\nFROM run r\nJOIN task t              ON t.task_id = r.task_id\nJOIN query q             ON q.query_id = t.query_id\nJOIN dataset d           ON d.dataset_id = t.dataset_id\nJOIN engine e            ON e.engine_id = r.engine_id\nJOIN build_event be      ON be.build_event_id = r.build_event_id\nJOIN build_spec bs       ON bs.spec_id = be.spec_id\nJOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id\nJOIN machine m           ON m.machine_id = ms.machine_id\nWHERE r.quality = 'clean'\n  AND (t.threads & (t.threads - 1)) = 0     -- powers of two only\n  -- AND bs.config_name = 'default_huge'\nGROUP BY m.machine_id, q.query_id, e.engine_id, d.dataset_id, t.threads\nORDER BY m.stable_key, q.q_number, t.threads",
-  "spec": "{\n  \"$schema\": \"https://vega.github.io/schema/vega-lite/v5.json\",\n  \"data\": {\n    \"name\": \"table\"\n  },\n  \"facet\": {\n    \"row\": {\n      \"field\": \"node\",\n      \"type\": \"nominal\",\n      \"title\": null\n    },\n    \"column\": {\n      \"field\": \"query\",\n      \"type\": \"nominal\",\n      \"title\": null,\n      \"sort\": {\n        \"field\": \"q_number\"\n      }\n    }\n  },\n  \"spec\": {\n    \"width\": 190,\n    \"height\": 165,\n    \"mark\": {\n      \"type\": \"line\",\n      \"point\": true\n    },\n    \"encoding\": {\n      \"x\": {\n        \"field\": \"threads\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\",\n          \"base\": 2\n        },\n        \"title\": \"threads\"\n      },\n      \"y\": {\n        \"field\": \"median_ms\",\n        \"type\": \"quantitative\",\n        \"scale\": {\n          \"type\": \"log\"\n        },\n        \"title\": \"median ms\"\n      },\n      \"color\": {\n        \"field\": \"engine\",\n        \"type\": \"nominal\"\n      },\n      \"strokeDash\": {\n        \"field\": \"sf_label\",\n        \"type\": \"nominal\",\n        \"title\": \"scale\"\n      },\n      \"tooltip\": [\n        {\n          \"field\": \"node\"\n        },\n        {\n          \"field\": \"query\"\n        },\n        {\n          \"field\": \"engine\"\n        },\n        {\n          \"field\": \"sf_label\"\n        },\n        {\n          \"field\": \"threads\"\n        },\n        {\n          \"field\": \"median_ms\"\n        }\n      ]\n    }\n  },\n  \"config\": {\n    \"background\": null,\n    \"font\": \"ui-monospace, Menlo, Consolas, monospace\",\n    \"axis\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12,\n      \"grid\": true,\n      \"gridColor\": \"#8884\",\n      \"domainColor\": \"#8886\",\n      \"tickColor\": \"#8886\"\n    },\n    \"legend\": {\n      \"labelFontSize\": 11,\n      \"titleFontSize\": 12\n    },\n    \"view\": {\n      \"stroke\": \"transparent\"\n    },\n    \"range\": {\n      \"category\": [\n        \"#0b5\",\n        \"#c50\",\n        \"#06c\",\n        \"#a2b\",\n        \"#888\",\n        \"#c33\"\n      ]\n    }\n  }\n}"
- }
-};
-
+async function loadViews() {
+  const res = await fetch(VIEWS_URL, { cache: "no-cache" });
+  if (!res.ok) throw new Error(`${VIEWS_URL}: ${res.status} ${res.statusText}`);
+  const doc = await res.json();
+  const list = Array.isArray(doc) ? doc : doc.views;
+  if (!Array.isArray(list)) throw new Error(`${VIEWS_URL}: no "views" array`);
+  for (const v of list) {
+    if (!v || !v.name || !v.sql) continue;
+    if (v.tab === "chart") CHART_VIEWS[v.name] = { sql: v.sql, spec: v.spec || "{}", desc: v.desc || "" };
+    else { TABLE_VIEWS[v.name] = v.sql; if (v.desc) TABLE_DESC[v.name] = v.desc; }
+  }
+  return list.length;
+}
 const $ = id => document.getElementById(id);
 const status = $("status"), meta = $("meta"), specerr = $("specerr");
 let db = null, cols = [], rows = [], sortCol = null, sortDir = 1, tab = "table";
@@ -152,13 +132,114 @@ function readHash() {
 }
 const h0 = readHash();
 
-function shareURL() {
-  let u = location.origin + location.pathname
-        + "#t=" + tab + "&q=" + encodeURIComponent($("sql").value);
+// ---- link shortening -----------------------------------------------------
+// Three tiers, shortest that applies:
+//   #t=chart&n=<view>              an unmodified preset -- just its name
+//   #t=chart&n=<view>&zq=<blob>    SQL edited, spec still the preset's
+//   #t=chart&z=<blob>              both edited
+// Plain &q=/&v= are still read, so older links keep working and the hash
+// stays hand-editable.
+//
+// Compression is the browser's own deflate-raw via CompressionStream, so
+// there is nothing extra to vendor. Where it is missing (pre-2023 browsers)
+// we fall back to the plain encoding -- longer, but never broken.
+const HAS_CS = typeof CompressionStream !== "undefined";
+
+const b64u = {
+  enc: buf => btoa(String.fromCharCode(...new Uint8Array(buf)))
+                .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
+  dec: s => Uint8Array.from(
+    atob(s.replace(/-/g, "+").replace(/_/g, "/")), ch => ch.charCodeAt(0)),
+};
+
+async function deflate(str) {
+  const cs = new CompressionStream("deflate-raw");
+  const w = cs.writable.getWriter();
+  w.write(new TextEncoder().encode(str)); w.close();
+  return b64u.enc(await new Response(cs.readable).arrayBuffer());
+}
+async function inflate(blob) {
+  const ds = new DecompressionStream("deflate-raw");
+  const w = ds.writable.getWriter();
+  w.write(b64u.dec(blob)); w.close();
+  return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+}
+
+// Which preset, if any, the editors currently hold.
+function matchPreset() {
+  const set = tab === "chart" ? CHART_VIEWS : TABLE_VIEWS;
+  const sql = $("sql").value, spec = $("spec").value;
+  for (const [name, d] of Object.entries(set)) {
+    const psql = tab === "chart" ? d.sql : d;
+    if (psql === sql) {
+      return { name, sql: true, spec: tab !== "chart" || d.spec === spec };
+    }
+  }
+  if (tab === "chart") {                 // SQL edited but spec untouched
+    for (const [name, d] of Object.entries(CHART_VIEWS))
+      if (d.spec === spec) return { name, sql: false, spec: true };
+  }
+  return null;
+}
+
+const SEP = "\u0000";
+
+async function shareHash() {
+  const base = "#t=" + tab;
+  const m = matchPreset();
+  if (m && m.sql && m.spec) return base + "&n=" + encodeURIComponent(m.name);
+  if (HAS_CS) {
+    if (m && m.spec)                     // spec comes from the preset
+      return base + "&n=" + encodeURIComponent(m.name)
+                  + "&zq=" + await deflate($("sql").value);
+    const payload = tab === "chart"
+      ? $("sql").value + SEP + $("spec").value : $("sql").value;
+    return base + "&z=" + await deflate(payload);
+  }
+  let u = base + "&q=" + encodeURIComponent($("sql").value);
   if (tab === "chart") u += "&v=" + encodeURIComponent($("spec").value);
   return u;
 }
-function syncHash() { history.replaceState(null, "", shareURL().replace(/^[^#]*/, "")); }
+
+async function shareURL() {
+  return location.origin + location.pathname + await shareHash();
+}
+
+// Fire-and-forget; the sequence guard stops a slow compress from overwriting
+// the hash of a newer edit.
+let hashSeq = 0;
+async function syncHash() {
+  const mine = ++hashSeq;
+  try {
+    const hash = await shareHash();
+    if (mine === hashSeq) history.replaceState(null, "", hash);
+  } catch {}
+}
+
+// Resolve an incoming hash into the editors. Returns false if it said nothing.
+async function applyHash(hh) {
+  const set = hh.t === "chart" ? CHART_VIEWS : TABLE_VIEWS;
+  let sql = null, spec = null;
+  if (hh.n && set[hh.n]) {
+    const d = set[hh.n];
+    sql  = hh.t === "chart" ? d.sql : d;
+    if (hh.t === "chart") spec = d.spec;
+  }
+  try {
+    if (hh.z)  { const parts = (await inflate(hh.z)).split(SEP);
+                 sql = parts[0]; if (parts.length > 1) spec = parts[1]; }
+    if (hh.zq) { sql = await inflate(hh.zq); }
+  } catch (e) {
+    fail("could not decode the link: " + (e.message || e));
+    return false;
+  }
+  if (hh.q) sql = hh.q;                  // plain forms still win if present
+  if (hh.v && hh.t === "chart") spec = hh.v;
+  if (sql === null && spec === null) return false;
+  if (sql  !== null) $("sql").value  = sql;
+  if (spec !== null) $("spec").value = spec;
+  return true;
+}
 
 // The two tabs carry independent view sets: table views are SQL only, chart
 // views pair SQL with a spec. Switching rebuilds the button row.
@@ -170,6 +251,9 @@ function buildViewButtons() {
   for (const name of Object.keys(set)) {
     const b = document.createElement("button");
     b.textContent = name;
+    // Prose from the view's markdown file, if any.
+    const d = tab === "chart" ? (set[name].desc || "") : (TABLE_DESC[name] || "");
+    if (d) b.title = d;
     b.onclick = () => {
       if (tab === "chart") {
         $("sql").value = set[name].sql;
@@ -192,12 +276,8 @@ function setTab(t, keepSql) {
   $("svg").classList.toggle("hide", t !== "chart");
   buildViewButtons();
   if (!keepSql) {
-    // Load that tab's first view, so switching always lands on something real.
-    const set = t === "chart" ? CHART_VIEWS : TABLE_VIEWS;
-    const first = Object.keys(set)[0];
-    $("sql").value = t === "chart" ? set[first].sql : set[first];
-    if (t === "chart") $("spec").value = set[first].spec;
-    if (db) run();
+    // Switching tabs lands on that tab's first view, when there is one.
+    if (loadFirstView() && db) run();
   } else if (t === "chart") { draw(); }
   syncHash();
 }
@@ -206,12 +286,15 @@ $("tabChart").onclick = () => setTab("chart");
 
 // Initial state: hash wins, else the first view of the chosen tab.
 tab = h0.t === "chart" ? "chart" : "table";
-buildViewButtons();
-{
+// Editor defaults are filled once views.json has loaded.
+function loadFirstView() {
   const set = tab === "chart" ? CHART_VIEWS : TABLE_VIEWS;
   const first = Object.keys(set)[0];
-  $("sql").value  = h0.q || (tab === "chart" ? set[first].sql : set[first]);
-  $("spec").value = h0.v || CHART_VIEWS[Object.keys(CHART_VIEWS)[0]].spec;
+  if (first === undefined) return false;
+  $("sql").value = tab === "chart" ? set[first].sql : set[first];
+  const c0 = Object.keys(CHART_VIEWS)[0];
+  if (c0) $("spec").value = CHART_VIEWS[c0].spec;
+  return true;
 }
 
 function fail(msg) { status.textContent = msg; status.className = "err"; }
@@ -219,6 +302,7 @@ function fail(msg) { status.textContent = msg; status.className = "err"; }
 (async () => {
   try {
     const SQL = await initSqlJs({ locateFile: f => f });
+    if (h0.views) VIEWS_URL = h0.views;
     const names = h0.db ? [h0.db, ...DB_CANDIDATES] : DB_CANDIDATES;
     let res = null; const tried = [];
     for (const n of names) {
@@ -234,7 +318,23 @@ function fail(msg) { status.textContent = msg; status.className = "err"; }
     status.textContent = `${n.toLocaleString()} runs \u00b7 ${(buf.byteLength/1048576).toFixed(1)} MB`
       + (when ? ` \u00b7 published ${when}` : "");
     $("run").disabled = $("csv").disabled = $("link").disabled = $("svg").disabled = false;
+
+    // Views come from views.json. A missing file is not fatal: the SQL box
+    // still works, there are simply no buttons.
+    let nviews = 0;
+    try {
+      nviews = await loadViews();
+    } catch (e) {
+      status.textContent += " \u00b7 no views (" + (e.message || e) + ")";
+    }
+    buildViewButtons();
+    loadFirstView();
+
+    // After the views exist, so a #n=<view> link can resolve. Decoding a
+    // compressed hash is async, hence here rather than at parse time.
+    await applyHash(h0);
     setTab(tab, true);
+    if (nviews) status.textContent += ` \u00b7 ${nviews} views`;
     run();
   } catch (e) { fail("could not load database: " + e.message); }
 })();
@@ -334,11 +434,17 @@ async function toClipboard(text) {
 }
 
 $("link").onclick = async () => {
-  const url = shareURL(), was = meta.textContent;
+  const was = meta.textContent;
+  const url = await shareURL();
+  const hash = url.slice(url.indexOf("#"));
+  const how = hash.includes("&n=") && !hash.includes("&zq=") ? "preset"
+            : hash.includes("&zq=") ? "preset + edited SQL"
+            : hash.includes("&z=")  ? "compressed"
+            : "uncompressed";
   const ok = await toClipboard(url);
-  meta.textContent = ok ? `link copied \u00b7 ${url.length} chars`
+  meta.textContent = ok ? `link copied \u00b7 ${url.length} chars \u00b7 ${how}`
                         : "could not copy \u2014 the address bar already holds it";
-  setTimeout(() => { meta.textContent = was; }, 2500);
+  setTimeout(() => { meta.textContent = was; }, 3000);
 };
 
 $("csv").onclick = () => {

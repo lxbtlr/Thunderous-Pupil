@@ -37,8 +37,30 @@ for pkg in vega vega-lite vega-embed; do
   else say "$out" "DOWNLOAD FAILED"; FAILED=1; rm -f "$out"; fi
 done
 
+# Regenerate the views from web/views/*.md before copying, so the page always
+# ships what the markdown says. Skipped if there is no views dir (older
+# layouts) or no python3.
+if [[ -d "$HERE/views" ]] && command -v python3 >/dev/null; then
+  if "$HERE/../bin/build-views" >/tmp/bv.$$ 2>&1; then
+    say "views.json" "$(grep -c '^  \(chart\|table\)' /tmp/bv.$$) views built from markdown"
+  else
+    say "views.json" "BUILD FAILED -- see below; keeping the previous file"
+    sed 's/^/      /' /tmp/bv.$$ | tail -12
+    FAILED=1
+  fi
+  rm -f /tmp/bv.$$
+fi
+
+if [[ -s "$HERE/views.json" ]]; then
+  cp "$HERE/views.json" .
+  say "views.json" "copied ($(stat -c%s views.json) bytes)"
+else
+  say "views.json" "MISSING -- page will load with no view buttons"
+  FAILED=1
+fi
+
 cp "$HERE/index.html" .
-chmod 644 index.html ./*.js ./*.wasm 2>/dev/null || true
+chmod 644 index.html views.json ./*.js ./*.wasm 2>/dev/null || true
 say "index.html" "copied"
 
 echo
