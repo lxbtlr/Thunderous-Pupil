@@ -55,7 +55,8 @@ def resolve_snapshot(out_file, manifest_snapshot):
 
 
 def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
-                snapshot_id, timing_unit, trial, label, header_version):
+                snapshot_id, timing_unit, trial, label, header_version,
+                scheduling='default'):
     p = Path(out_file)
     if not p.is_file():
         return None, f"missing: {out_file}"
@@ -106,15 +107,15 @@ def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
                 "VALUES (?,?,?,?,?)", (qid, dataset_id, r.threads, None, th)).lastrowid
 
         run_id = one(conn, "SELECT run_id FROM run WHERE task_id=? AND build_event_id=? "
-                           "AND snapshot_id=? AND engine_id=? AND trial=?",
-                     (task_id, build_event_id, snapshot_id, eid, trial))
+                           "AND snapshot_id=? AND engine_id=? AND trial=? AND scheduling=?",
+                     (task_id, build_event_id, snapshot_id, eid, trial, scheduling))
         if run_id is None:
             t = r.timings_ns
             run_id = conn.execute(
                 "INSERT INTO run (task_id, build_event_id, snapshot_id, engine_id, trial, "
-                "median_ns, mean_ns, min_ns, max_ns, stddev_ns, cpus, batch_id, "
-                "source_row_ord, raw_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (task_id, build_event_id, snapshot_id, eid, trial,
+                "scheduling, median_ns, mean_ns, min_ns, max_ns, stddev_ns, cpus, batch_id, "
+                "source_row_ord, raw_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, build_event_id, snapshot_id, eid, trial, scheduling,
                  t.get("median"), t.get("mean"), t.get("min"), t.get("max"),
                  t.get("stddev"), r.cpus, batch_id, r.row_ord, r.raw_name)).lastrowid
 
@@ -293,6 +294,10 @@ ap.add_argument("--timing-unit", default="s", choices=["s", "ms", "us", "ns"],
                 help="unit run_tpch reports timings in. VERIFY against run.cpp; "
                      "ratios are safe either way, absolute numbers are not.")
 ap.add_argument("--trial", type=int, default=0)
+ap.add_argument("--scheduling", default="default",
+                help="runtime scheduling policy this run used, e.g. 'default' | "
+                     "'chrt-f1'. Part of the run natural key, so the same binary "
+                     "re-run under a different policy is a distinct run, not a dedup.")
 ap.add_argument("--header-version", default=HEADER_VERSION)
 a = ap.parse_args()
 
@@ -330,7 +335,8 @@ with writing() as conn:
             continue
         n, msg = ingest_file(conn, colmap, snapshot_id=snap,
                              timing_unit=a.timing_unit, trial=a.trial,
-                             header_version=a.header_version, **j)
+                             header_version=a.header_version, scheduling=a.scheduling,
+                             **j)
         print(msg)
         if n is None:
             failures.append(msg)
