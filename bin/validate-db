@@ -81,7 +81,7 @@ def main() -> int:
         # a product. Compare against what each query actually uses on that node.
         for be, node, q, got, want in conn.execute("""
             WITH per_query AS (
-                SELECT r.build_event_id AS be, ms.machine_id, t.query_id,
+                SELECT r.build_event_id AS be, ms.machine_id, t.query_id, r.scheduling,
                        COUNT(DISTINCT r.engine_id) AS engines,
                        COUNT(DISTINCT t.task_id)   AS tasks,
                        COUNT(*)                    AS runs
@@ -89,7 +89,7 @@ def main() -> int:
                 JOIN task t              ON t.task_id = r.task_id
                 JOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id
                 WHERE r.quality = 'clean'
-                GROUP BY r.build_event_id, ms.machine_id, t.query_id
+                GROUP BY r.build_event_id, ms.machine_id, t.query_id, r.scheduling
             )
             SELECT pq.be, m.stable_key, q.label, pq.runs, pq.tasks * pq.engines
             FROM per_query pq
@@ -132,10 +132,10 @@ def main() -> int:
         # for q6 but only v/h elsewhere, so 2 is correct outside q6 and 3 inside.
         for q, node, k, n in conn.execute("""
             SELECT qq.label, m.stable_key, x.k, COUNT(*)
-            FROM (SELECT task_id, build_event_id, snapshot_id, trial,
+            FROM (SELECT task_id, build_event_id, snapshot_id, trial, scheduling,
                          COUNT(DISTINCT engine_id) AS k
                   FROM run WHERE quality = 'clean'
-                  GROUP BY task_id, build_event_id, snapshot_id, trial) x
+                  GROUP BY task_id, build_event_id, snapshot_id, trial, scheduling) x
             JOIN task t              ON t.task_id = x.task_id
             JOIN query qq            ON qq.query_id = t.query_id
             JOIN machine_snapshot ms ON ms.snapshot_id = x.snapshot_id
