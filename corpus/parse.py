@@ -60,6 +60,44 @@ def parse_name(raw: str):
     return int(m.group("q")), m.group("engine"), int(m.group("threads"))
 
 
+def header_of(text: str) -> list[str]:
+    """Return the first normalized header row (first cell 'name')."""
+    for cells in csv.reader(io.StringIO(text)):
+        cells = normalize_header(cells)
+        if cells and cells[0] == "name":
+            return cells
+    raise ParseError("no header row found; is this really run_tpch output?")
+
+
+def resolve_text_map(header: list[str], text_map: dict) -> dict:
+    """Build a positional column_map from a run's OWN header using the
+    layout-independent header_token vocabulary (raw text -> role/event).
+
+    This is the generalizable ingest path: columns are matched by TEXT, so a
+    layout change (an extra probed PMU event, a reorder in run.cpp) needs no
+    new header_version. A genuinely new event still needs a vocabulary
+    migration -- unknown text is rejected here, naming the offending column,
+    rather than being guessed. Duplicate texts are preserved: the map is keyed
+    by col_ord, so two columns sharing a text stay two distinct entries.
+    """
+    cmap: dict = {}
+    problems = []
+    for i, h in enumerate(header):
+        spec = text_map.get(h)
+        if spec is None:
+            problems.append(f"[{i}] {h!r} not in header_token")
+        else:
+            cmap[i] = {"col_ord": i, "raw_header": h,
+                       "role": spec["role"],
+                       "timing_stat": spec.get("timing_stat"),
+                       "event_id": spec.get("event_id")}
+    if problems:
+        raise ParseError(
+            "header text not in header_token: " + "; ".join(problems)
+            + " -- add the event to the vocabulary in a migration, not a guess")
+    return cmap
+
+
 def parse_out(text: str, column_map: dict, *, timing_unit: str = "s"):
     """
     column_map: {col_ord: {"role":..., "timing_stat":..., "event_id":...}}

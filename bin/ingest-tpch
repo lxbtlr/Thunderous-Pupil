@@ -20,12 +20,12 @@ is worse than not recording it.
 One transaction per file. Idempotent on the .out's content hash and on each
 run's natural key, so re-ingesting after a parser fix is a no-op.
 """
-import argparse, sys
+import argparse, hashlib, sys
 from pathlib import Path
 import _common  # noqa: F401
 from corpus.db import writing, utcnow, one
 from corpus.hashing import file_sha256, task_hash
-from corpus.parse import parse_out, header_signature, ParseError
+from corpus.parse import parse_out, header_of, resolve_text_map, header_signature, ParseError
 from corpus import __version__
 
 HEADER_VERSION = "v1"
@@ -38,6 +38,27 @@ def load_column_map(conn, version):
     if not rows:
         sys.exit(f"no csv_column rows for header_version {version!r}")
     return {r["col_ord"]: dict(r) for r in rows}
+
+
+def load_text_map(conn):
+    """Layout-independent vocabulary for the 'template' header version."""
+    rows = conn.execute(
+        "SELECT raw_header, role, timing_stat, event_id FROM header_token").fetchall()
+    if not rows:
+        sys.exit("header_token is empty; apply migration 0023_header_template")
+    return {r["raw_header"]: dict(r) for r in rows}
+
+
+def record_layout(conn, header, version):
+    """Record a concrete header shape seen under template mode (idempotent)."""
+    sig = header_signature(header)
+    sha = hashlib.sha256(sig.encode()).digest()
+    if not one(conn, "SELECT signature_sha256 FROM header_layout WHERE signature_sha256=?",
+               (sha,)):
+        conn.execute(
+            "INSERT INTO header_layout (signature_sha256, header_version, signature, "
+            "n_cols, first_seen_at, note) VALUES (?,?,?,?,?,?)",
+            (sha, version, sig, len(header), utcnow(), None))
 
 
 def resolve_snapshot(out_file, manifest_snapshot):
@@ -56,7 +77,8 @@ def resolve_snapshot(out_file, manifest_snapshot):
 
 def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
                 snapshot_id, timing_unit, trial, label, header_version,
-                scheduling='default'):
+                scheduling='default', simd_sel=0, simd_join=0, simd_proj=0, simd_hash=0,
+                text_map=None):
     p = Path(out_file)
     if not p.is_file():
         return None, f"missing: {out_file}"
@@ -66,12 +88,20 @@ def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
     text = p.read_text()
     if not text.strip():
         return None, f"empty: {p.name}"
+    if text_map is not None:
+        # template mode: resolve the run's OWN header by text, no fixed layout
+        try:
+            colmap = resolve_text_map(header_of(text), text_map)
+        except ParseError as e:
+            return None, f"{p.name}: {e}"
     try:
         rows, header = parse_out(text, colmap, timing_unit=timing_unit)
     except ParseError as e:
         return None, f"{p.name}: {e}"
     if not rows:
         return None, f"{p.name}: header but no data rows"
+    if text_map is not None:
+        record_layout(conn, header, header_version)
 
     ds = conn.execute("SELECT benchmark, manifest_sha256 FROM dataset WHERE dataset_id = ?",
                       (dataset_id,)).fetchone()
@@ -107,15 +137,19 @@ def ingest_file(conn, colmap, *, out_file, build_event_id, dataset_id,
                 "VALUES (?,?,?,?,?)", (qid, dataset_id, r.threads, None, th)).lastrowid
 
         run_id = one(conn, "SELECT run_id FROM run WHERE task_id=? AND build_event_id=? "
-                           "AND snapshot_id=? AND engine_id=? AND trial=? AND scheduling=?",
-                     (task_id, build_event_id, snapshot_id, eid, trial, scheduling))
+                           "AND snapshot_id=? AND engine_id=? AND trial=? AND scheduling=? "
+                           "AND simd_sel=? AND simd_join=? AND simd_proj=? AND simd_hash=?",
+                     (task_id, build_event_id, snapshot_id, eid, trial, scheduling,
+                      simd_sel, simd_join, simd_proj, simd_hash))
         if run_id is None:
             t = r.timings_ns
             run_id = conn.execute(
                 "INSERT INTO run (task_id, build_event_id, snapshot_id, engine_id, trial, "
-                "scheduling, median_ns, mean_ns, min_ns, max_ns, stddev_ns, cpus, batch_id, "
-                "source_row_ord, raw_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "scheduling, simd_sel, simd_join, simd_proj, simd_hash, "
+                "median_ns, mean_ns, min_ns, max_ns, stddev_ns, cpus, batch_id, "
+                "source_row_ord, raw_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, build_event_id, snapshot_id, eid, trial, scheduling,
+                 simd_sel, simd_join, simd_proj, simd_hash,
                  t.get("median"), t.get("mean"), t.get("min"), t.get("max"),
                  t.get("stddev"), r.cpus, batch_id, r.row_ord, r.raw_name)).lastrowid
 
@@ -298,6 +332,10 @@ ap.add_argument("--scheduling", default="default",
                 help="runtime scheduling policy this run used, e.g. 'default' | "
                      "'chrt-f1'. Part of the run natural key, so the same binary "
                      "re-run under a different policy is a distinct run, not a dedup.")
+for _f, _n in (("sel", "sel"), ("join", "join"), ("proj", "proj"), ("hash", "hash")):
+    ap.add_argument(f"--simd-{_f}", type=int, default=0,
+                    help=f"SIMD{_n} runtime env toggle this run used (0/1). Part of "
+                         f"the run natural key, so SIMD{_n} on/off are distinct runs.")
 ap.add_argument("--header-version", default=HEADER_VERSION)
 a = ap.parse_args()
 
@@ -326,7 +364,10 @@ else:
 
 failures, total = [], 0
 with writing() as conn:
-    colmap = load_column_map(conn, a.header_version)
+    if a.header_version == "template":
+        colmap, text_map = None, load_text_map(conn)
+    else:
+        colmap, text_map = load_column_map(conn, a.header_version), None
     for j in jobs:
         snap, err = resolve_snapshot(j["out_file"], j.pop("manifest_snapshot"))
         if err:
@@ -336,7 +377,9 @@ with writing() as conn:
         n, msg = ingest_file(conn, colmap, snapshot_id=snap,
                              timing_unit=a.timing_unit, trial=a.trial,
                              header_version=a.header_version, scheduling=a.scheduling,
-                             **j)
+                             simd_sel=a.simd_sel, simd_join=a.simd_join,
+                             simd_proj=a.simd_proj, simd_hash=a.simd_hash,
+                             text_map=text_map, **j)
         print(msg)
         if n is None:
             failures.append(msg)
