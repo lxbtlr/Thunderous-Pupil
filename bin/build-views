@@ -140,6 +140,53 @@ def load_all():
     return views, problems
 
 
+def derived_fields(spec_json):
+    """
+    Field names a transform invents, which the query is not expected to return.
+
+    Walks the parsed spec rather than regexing it, because "as" comes in two
+    shapes: a string ({"calculate": ..., "as": "x"}) and a list
+    ({"fold": [...], "as": ["key","value"]}). A regex for the string form
+    silently misses every fold, and the view then fails validation for a
+    field that is perfectly legitimate.
+    """
+    out = set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            a = node.get("as")
+            if isinstance(a, str):
+                out.add(a)
+            elif isinstance(a, list):
+                for x in a:
+                    if isinstance(x, str):
+                        out.add(x)
+                    elif isinstance(x, dict) and isinstance(x.get("as"), str):
+                        out.add(x["as"])
+            # window/joinaggregate/aggregate carry their own nested "as"
+            for key in ("window", "joinaggregate", "aggregate"):
+                for op in node.get(key, []) or []:
+                    if isinstance(op, dict) and isinstance(op.get("as"), str):
+                        out.add(op["as"])
+            # fold with no explicit "as" defaults to key/value
+            if "fold" in node and "as" not in node:
+                out.update(("key", "value"))
+            # density/regression/loess defaults
+            if "density" in node and "as" not in node:
+                out.update(("value", "density"))
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    try:
+        visit(json.loads(spec_json))
+    except json.JSONDecodeError:
+        pass
+    return out
+
+
 def validate_sql(views):
     """Run every query; for charts, check the spec's fields come back."""
     db = os.environ.get("CORPUS_DB")
@@ -160,8 +207,8 @@ def validate_sql(views):
                          f"(fine if the corpus lacks that data yet)")
         if v["tab"] != "chart":
             continue
-        calc = set(re.findall(r'"as":\s*"([^"]+)"', v["spec"]))
-        fields = set(re.findall(r'"field":\s*"([^"]+)"', v["spec"])) - calc
+        derived = derived_fields(v["spec"])
+        fields = set(re.findall(r'"field":\s*"([^"]+)"', v["spec"])) - derived
         missing = sorted(f for f in fields if f not in cols)
         if missing:
             problems.append(
@@ -257,4 +304,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

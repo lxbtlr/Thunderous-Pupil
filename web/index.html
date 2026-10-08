@@ -10,9 +10,13 @@
     :root { --fg:#e6e6e6; --dim:#999; --line:#333; --bg:#141414; --accent:#3d9; }
   }
   * { box-sizing: border-box; }
+  /* Full width. No max-width cap, no viewport-relative sizing anywhere --
+     the page is ordinary document flow, so it fills whatever it is given and
+     scrolls naturally when the content is taller than the window. */
   body { font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-         color: var(--fg); background: var(--bg); margin: 0; padding: 1.5rem;
-         max-width: 1600px; }
+         color: var(--fg); background: var(--bg); margin: 0;
+         /* gutters scale with the window without a media query */
+         padding: 1.25rem clamp(0.75rem, 2%, 2.5rem); }
   h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 .25rem; }
   #status { color: var(--dim); margin-bottom: 1rem; }
   #status.err { color: #c33; }
@@ -30,24 +34,42 @@
   .tabs button { padding: .4rem 1.1rem; }
   textarea { width: 100%; font: inherit; padding: .6rem;
              background: var(--bg); color: var(--fg);
-             border: 1px solid var(--line); border-radius: 3px; resize: vertical; }
+             border: 1px solid var(--line); border-radius: 3px;
+             /* drag to resize; no fixed cap */
+             resize: vertical; }
   #sql { min-height: 9rem; }
   #spec { min-height: 15rem; }
   #meta { color: var(--dim); margin: .75rem 0; }
-  .scroll { overflow: auto; max-height: 65vh; border: 1px solid var(--line);
-            border-radius: 3px; }
+
+  /* Table: grows with its content instead of being clipped to a fraction of
+     the window. Horizontal scroll only, for tables wider than the page. */
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 3px; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
   th, td { padding: .3rem .6rem; text-align: left; white-space: nowrap;
            border-bottom: 1px solid var(--line); }
   th { position: sticky; top: 0; background: var(--bg); font-weight: 600;
-       cursor: pointer; user-select: none; }
+       cursor: pointer; user-select: none; z-index: 1; }
   th:hover { color: var(--accent); }
   td.num { text-align: left; font-variant-numeric: tabular-nums; }
   tbody tr:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
-  .panes { display: grid; grid-template-columns: 400px 1fr; gap: 1rem; }
-  @media (max-width: 950px) { .panes { grid-template-columns: 1fr; } }
+
+  /* Spec editor beside the chart, wrapping to stacked when there is no room.
+     flex-wrap does the breakpoint by itself -- the flex-basis values are the
+     breakpoint, so there is no media query and nothing keyed to the window. */
+  .panes { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+  .panes > .editor { flex: 1 1 22rem; min-width: 0; max-width: 34rem; }
+  /* the outsized grow factor gives the chart the slack when both fit on a row */
+  .panes > .plot   { flex: 999 1 32rem; min-width: 0; }
+  /* Scroll rather than scale: shrinking a small-multiples grid to fit makes
+     the axis labels unreadable, so the pane scrolls when the facet grid is
+     wider than the space. */
   #chart { border: 1px solid var(--line); border-radius: 3px; padding: .75rem;
-           overflow: auto; min-height: 22rem; }
+           overflow-x: auto;
+           /* vega-embed sets display:inline-block on its container, which makes
+              the box grow to the chart's width instead of the pane's -- then
+              overflow-x never engages and the whole PAGE scrolls sideways.
+              The id beats its class, so pin it back to a full-width block. */
+           display: block; width: 100%; box-sizing: border-box; }
   .hide { display: none; }
   #specerr { color: #c33; font-size: 12px; min-height: 1.2em; }
 </style>
@@ -78,12 +100,12 @@
 </div></div>
 
 <div id="paneChart" class="hide panes">
-  <div>
+  <div class="editor">
     <div class="label">Vega-Lite spec &mdash; query result injected as <code>values</code></div>
     <textarea id="spec" spellcheck="false"></textarea>
     <div id="specerr"></div>
   </div>
-  <div id="chart"></div>
+  <div class="plot"><div id="chart"></div></div>
 </div>
 
 <script src="sql-wasm.js"></script>
@@ -382,8 +404,19 @@ async function draw() {
   } catch (e) { specerr.textContent = "Vega-Lite: " + (e.message || e); }
 }
 
-let specTimer = null;
-$("spec").oninput = () => { clearTimeout(specTimer); specTimer = setTimeout(draw, 400); };
+// Keep the address bar in step with the editors, not just with the last Run.
+// Without this a spec edit redraws the chart but leaves the hash on the old
+// preset, so copying the URL silently loses the edit. Debounced, and
+// syncHash's sequence guard makes overlapping calls safe.
+let specTimer = null, sqlTimer = null;
+$("spec").oninput = () => {
+  clearTimeout(specTimer);
+  specTimer = setTimeout(() => { draw(); syncHash(); }, 400);
+};
+$("sql").oninput = () => {
+  clearTimeout(sqlTimer);
+  sqlTimer = setTimeout(syncHash, 400);
+};
 
 function render() {
   const idx = sortCol === null ? null : cols.indexOf(sortCol);
@@ -470,4 +503,3 @@ $("svg").onclick = async () => {
 </script>
 </body>
 </html>
-

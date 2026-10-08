@@ -1,53 +1,59 @@
-# 3. thread sweep by query
+# 3. thread sweep by query (speedup)
+
 tab: chart
 
+Scalability, not raw time: speedup over each series' own 1-thread run, log-log
+against an ideal-linear reference. Pins one scale factor and one build.
+
 ```sql
--- Runtime against thread count. One row per machine, one column per query,
--- one colour per engine. All measured thread counts.
+-- THREAD SWEEP -- SPEEDUP FORM
 --
--- The spec sets resolve.scale.x = independent, so each panel gets its own
--- x axis. dubliner sweeps to 384 threads, burrata only to 80; a shared axis
--- would pad burrata's panels with empty space out to 384.
+-- Plots speedup relative to each series' OWN 1-thread run, not absolute ms.
+-- That is the question a thread sweep is usually asked to answer: absolute
+-- runtime conflates "this engine is fast" with "this engine scales", and the
+-- second is what the sweep is for.
 --
--- GROUPING: every non-aggregate column in the SELECT is also in the GROUP BY.
--- SQLite allows a bare column in an aggregate query and just picks an
--- arbitrary row for it, so dropping one silently AVERAGES its series together
--- and mislabels the result. That is how you get one line per engine when you
--- expected one per (engine, build, scale factor).
---
--- As written you get one line per (engine, build, scale factor):
---   colour  = engine        dash = scale factor
---   opacity = config        detail keeps separate builds apart
--- That is a lot at once. Pin a dimension with one of the filters below to
--- thin it out -- fixing the scale factor is usually the first thing to do.
-SELECT m.stable_key       AS node,
-       q.label            AS query,
-       q.q_number,
-       e.code             AS engine,
-       bs.config_name,
-       be.build_event_id,
-       d.sf_label,
-       d.scale_factor,
-       t.threads,
-       ROUND(AVG(r.median_ns) / 1e6, 3) AS median_ms,
-       COUNT(*)                         AS n_runs
-FROM run r
-JOIN task t              ON t.task_id = r.task_id
-JOIN query q             ON q.query_id = t.query_id
-JOIN dataset d           ON d.dataset_id = t.dataset_id
-JOIN engine e            ON e.engine_id = r.engine_id
-JOIN build_event be      ON be.build_event_id = r.build_event_id
-JOIN build_spec bs       ON bs.spec_id = be.spec_id
-JOIN machine_snapshot ms ON ms.snapshot_id = r.snapshot_id
-JOIN machine m           ON m.machine_id = ms.machine_id
-WHERE r.quality = 'clean'
-  AND q.q_number <> 5          -- q5 excluded; delete this line to include it
-  -- AND d.sf_label = 'sf10'
-  -- AND bs.config_name = 'default_huge'
-  -- AND be.build_event_id = (SELECT MAX(build_event_id) FROM build_event)
-GROUP BY m.machine_id, q.query_id, e.engine_id,
-         be.build_event_id, d.dataset_id, t.threads
-ORDER BY m.stable_key, q.q_number, e.code, d.scale_factor, t.threads
+
+WITH cell AS (
+    SELECT node, query, q_number, engine, paradigm,
+           build_event_id, config_name, sf_label, threads,
+           AVG(median_ms) AS median_ms,
+           MAX(cv)        AS worst_cv,
+           COUNT(*)       AS n_runs
+    FROM v_runs
+    WHERE quality = 'clean'
+      AND median_ms IS NOT NULL
+--and node = "dubliner"
+      AND q_number <> 5          -- q5 excluded; delete this line to include it
+      AND sf_label = 'sf100'      -- PIN: one data size, else you sweep two curves
+      --AND build_event_id = (SELECT MAX(build_event_id) FROM build_event)
+      AND ( config_name LIKE '%shard%' or config_name LIKE '%pin%')
+      -- AND ingested_at >= datetime('now', '-7 days')
+    GROUP BY node, q_number, engine, build_event_id, sf_label, threads
+),
+based AS (
+    SELECT cell.*,
+           MAX(CASE WHEN threads = 1 THEN median_ms END) OVER w AS base_ms,
+           MIN(median_ms)                                OVER w AS best_ms,
+           MAX(threads)                                  OVER w AS max_threads
+    FROM cell
+    WINDOW w AS (PARTITION BY node, q_number, engine, build_event_id, config_name, sf_label)
+)
+SELECT node, query, q_number, engine, paradigm,
+       build_event_id, config_name, sf_label, threads,
+       ROUND(median_ms, 3)                     AS median_ms,
+       ROUND(base_ms / median_ms, 3)           AS speedup,
+       -- speedup / threads: 1.0 is perfect, and the knee where this falls off
+       -- is the useful thread count. Swap it onto y to read saturation.
+       ROUND(base_ms / median_ms / threads, 3) AS efficiency,
+       threads                                 AS ideal,
+       ROUND(base_ms / best_ms, 3)             AS peak_speedup,
+       max_threads,
+       ROUND(worst_cv, 4)                      AS worst_cv,
+       n_runs
+FROM based
+WHERE base_ms IS NOT NULL
+ORDER BY node, q_number, engine, threads
 ```
 
 ```json
@@ -56,93 +62,127 @@ ORDER BY m.stable_key, q.q_number, e.code, d.scale_factor, t.threads
   "data": {
     "name": "table"
   },
+  "transform": [
+    {
+      "calculate": "datum.engine === 'v' ? 'vectorized (v)' : 'compiled (h, b)'",
+      "as": "engine_group"
+    },
+    {
+      "calculate": "datum.node + '/' + datum.build_event_id",
+      "as": "series"
+    }
+  ],
   "facet": {
     "row": {
-      "field": "node",
-      "type": "nominal",
-      "title": null
-    },
-    "column": {
       "field": "query",
       "type": "nominal",
       "title": null,
-      "sort": {
-        "field": "q_number"
-      }
+      "sort": {"field": "q_number"}
+    },
+    "column": {
+      "field": "engine_group",
+      "type": "nominal",
+      "title": null,
+      "sort": ["vectorized (v)", "compiled (h, b)"]
     }
   },
+  "spacing": 14,
   "spec": {
-    "width": 190,
-    "height": 160,
-    "mark": {
-      "type": "line",
-      "point": true
-    },
+    "width": 280,
+    "height": 250,
+    "layer": [
+      {
+        "mark": {
+          "type": "line",
+          "stroke": "#888",
+          "strokeDash": [3, 3],
+          "strokeWidth": 1,
+          "opacity": 0.6
+        },
+        "encoding": {
+          "y": {"field": "ideal", "type": "quantitative"}
+        }
+      },
+      {
+        "params": [
+          {
+            "name": "pick",
+            "select": {"type": "point", "fields": ["config_name"]},
+            "bind": "legend"
+          },
+          {
+            "name": "nodeSel",
+            "select": {"type": "point", "fields": ["node"]},
+            "bind": {
+              "input": "select",
+              "options": [null, "dubliner", "burrata", "manchego", "roquefort"],
+              "labels": ["all machines", "dubliner", "burrata", "manchego", "roquefort"],
+              "name": "machine  "
+            }
+          }
+        ],
+        "mark": {
+          "type": "line",
+          "point": {"size": 26, "filled": true},
+          "strokeWidth": 2
+        },
+        "encoding": {
+          "y": {
+            "field": "speedup",
+            "type": "quantitative",
+            "title": "speedup vs 1 thread",
+            "scale": {"type": "log", "base": 2}
+          },
+          "color": {
+            "field": "config_name",
+            "type": "nominal",
+            "title": "config"
+          },
+          "strokeDash": {
+            "field": "engine",
+            "type": "nominal",
+            "title": "engine"
+          },
+          "detail": {
+            "field": "series",
+            "type": "nominal"
+          },
+          "opacity": {
+            "condition": {
+              "test": {
+                "and": [
+                  {"param": "pick"},
+                  {"param": "nodeSel"}
+                ]
+              },
+              "value": 1
+            },
+            "value": 0.06
+          },
+          "tooltip": [
+            {"field": "node"},
+            {"field": "query"},
+            {"field": "engine"},
+            {"field": "config_name", "title": "config"},
+            {"field": "build_event_id", "title": "build"},
+            {"field": "threads"},
+            {"field": "speedup", "title": "speedup"},
+            {"field": "efficiency", "title": "eff (speedup/thr)"},
+            {"field": "median_ms", "title": "median ms"},
+            {"field": "peak_speedup", "title": "peak speedup"},
+            {"field": "worst_cv", "title": "worst cv"},
+            {"field": "n_runs"}
+          ]
+        }
+      }
+    ],
     "encoding": {
       "x": {
         "field": "threads",
         "type": "quantitative",
-        "scale": {
-          "type": "log",
-          "base": 2
-        },
-        "title": "threads"
-      },
-      "y": {
-        "field": "median_ms",
-        "type": "quantitative",
-        "title": "median ms"
-      },
-      "color": {
-        "field": "engine",
-        "type": "nominal"
-      },
-      "strokeDash": {
-        "field": "sf_label",
-        "type": "nominal",
-        "title": "scale"
-      },
-      "tooltip": [
-        {
-          "field": "node"
-        },
-        {
-          "field": "query"
-        },
-        {
-          "field": "engine"
-        },
-        {
-          "field": "config_name"
-        },
-        {
-          "field": "sf_label"
-        },
-        {
-          "field": "threads"
-        },
-        {
-          "field": "median_ms"
-        },
-        {
-          "field": "n_runs"
-        }
-      ],
-      "opacity": {
-        "field": "config_name",
-        "type": "nominal",
-        "title": "config",
-        "scale": {
-          "range": [
-            1.0,
-            0.55,
-            0.3
-          ]
-        }
-      },
-      "detail": {
-        "field": "build_event_id",
-        "type": "nominal"
+        "title": "threads",
+        "scale": {"type": "log", "base": 2},
+        "axis": {"format": "d", "labelAngle": 0}
       }
     }
   },
@@ -157,28 +197,8 @@ ORDER BY m.stable_key, q.q_number, e.code, d.scale_factor, t.threads
       "domainColor": "#8886",
       "tickColor": "#8886"
     },
-    "legend": {
-      "labelFontSize": 11,
-      "titleFontSize": 12
-    },
-    "view": {
-      "stroke": "transparent"
-    },
-    "range": {
-      "category": [
-        "#0b5",
-        "#c50",
-        "#06c",
-        "#a2b",
-        "#888",
-        "#c33"
-      ]
-    }
-  },
-  "resolve": {
-    "scale": {
-      "x": "independent"
-    }
+    "legend": {"labelFontSize": 11, "titleFontSize": 12},
+    "view": {"stroke": "transparent"}
   }
 }
 ```
